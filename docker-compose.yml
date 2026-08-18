@@ -1,0 +1,32 @@
+services:
+  pdf-to-tif:
+    build: .
+    image: pdf-to-tif:latest
+    container_name: pdf-to-tif
+    restart: unless-stopped
+    ports:
+      # Bind to localhost only - cloudflared reaches it from the host.
+      # Change to "9000:9000" if you want it exposed on the LAN.
+      - "127.0.0.1:9000:9000"
+    environment:
+      PORT: 9000
+      # Parallel page renderers. Leave unset to use min(8, CPU cores).
+      # RENDER_WORKERS: 4
+      MAX_UPLOAD_MB: 500
+      MAX_PAGES: 3000
+      MAX_CONCURRENT_JOBS: 2
+      JOB_TTL_MINUTES: 120
+      DEFAULT_DPI: 200
+    volumes:
+      - pdf2tif-data:/data
+    tmpfs:
+      - /tmp
+    # Rendering large pages is memory hungry; cap it so one PDF cannot
+    # take the whole VPS down. Raise if you convert huge documents.
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+
+volumes:
+  pdf2tif-data:

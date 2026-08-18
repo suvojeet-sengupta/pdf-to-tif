@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF → TIFF Converter</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗂️</text></svg>">
+</head>
+<body>
+<main class="shell">
+
+  <header class="head">
+    <h1>PDF <span class="arrow">→</span> TIFF</h1>
+    <p>Every page becomes its own TIFF file, delivered as one ZIP.</p>
+  </header>
+
+  <!-- ── step 1: pick a file ─────────────────────────────────────────── -->
+  <section id="pick" class="card">
+    <label id="drop" class="drop" for="file">
+      <input type="file" id="file" accept="application/pdf,.pdf" hidden>
+      <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke-linecap="round"/>
+      </svg>
+      <strong class="drop-title">Drop a PDF here</strong>
+      <span class="drop-sub">or click to browse &middot; max <b id="maxSize">—</b> MB</span>
+    </label>
+
+    <div id="chosen" class="chosen" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="file-icon">
+        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
+        <path d="M14 3v5h5"/>
+      </svg>
+      <div class="chosen-meta">
+        <span id="chosenName">—</span>
+        <small id="chosenSize"></small>
+      </div>
+      <button type="button" id="clearFile" class="ghost" title="Remove file">✕</button>
+    </div>
+
+    <div class="options">
+      <div class="opt">
+        <label for="dpi">Resolution</label>
+        <select id="dpi">
+          <option value="100">100 DPI &middot; draft</option>
+          <option value="150">150 DPI</option>
+          <option value="200" selected>200 DPI &middot; recommended</option>
+          <option value="300">300 DPI &middot; print</option>
+          <option value="400">400 DPI</option>
+          <option value="600">600 DPI &middot; archival</option>
+        </select>
+      </div>
+      <div class="opt">
+        <label for="color">Colour</label>
+        <select id="color">
+          <option value="color" selected>Full colour</option>
+          <option value="gray">Grayscale</option>
+          <option value="bw">Black &amp; white (G4)</option>
+        </select>
+      </div>
+      <div class="opt">
+        <label for="compression">TIFF compression</label>
+        <select id="compression">
+          <option value="lzw" selected>LZW &middot; fast, lossless</option>
+          <option value="packbits">PackBits &middot; fastest</option>
+          <option value="none">None &middot; raw, largest</option>
+          <option value="deflate">Deflate &middot; smallest</option>
+        </select>
+      </div>
+    </div>
+
+    <label class="check">
+      <input type="checkbox" id="zipCompress">
+      <span>Also compress the ZIP <small>(slower — off by default, TIFFs are already compressed)</small></span>
+    </label>
+
+    <button id="start" class="primary" disabled>Convert to TIFF</button>
+    <p id="pickError" class="error" hidden></p>
+  </section>
+
+  <!-- ── step 2: live progress ───────────────────────────────────────── -->
+  <section id="progress" class="card" hidden>
+    <div class="stage-row">
+      <span id="spinner" class="spinner"></span>
+      <div>
+        <strong id="stageLabel">Uploading</strong>
+        <small id="fileLabel"></small>
+      </div>
+      <span id="percent" class="percent">0%</span>
+    </div>
+
+    <div class="bar"><div id="barFill" class="bar-fill"></div></div>
+
+    <dl class="stats">
+      <div><dt>Pages</dt><dd id="statPages">0 / 0</dd></div>
+      <div><dt>Speed</dt><dd id="statRate">—</dd></div>
+      <div><dt>Elapsed</dt><dd id="statElapsed">0s</dd></div>
+      <div><dt>Remaining</dt><dd id="statEta">—</dd></div>
+      <div><dt>Output</dt><dd id="statSize">0 B</dd></div>
+    </dl>
+
+    <details class="logbox" open>
+      <summary>Activity log</summary>
+      <pre id="log"></pre>
+    </details>
+
+    <button id="cancel" class="ghost wide">Cancel</button>
+  </section>
+
+  <!-- ── step 3: result ──────────────────────────────────────────────── -->
+  <section id="result" class="card" hidden>
+    <div class="done-mark">✓</div>
+    <h2 id="resultTitle">Conversion complete</h2>
+    <p id="resultSummary" class="muted"></p>
+    <a id="download" class="primary as-link" href="#" download>Download ZIP</a>
+    <button id="again" class="ghost wide">Convert another PDF</button>
+    <p class="muted tiny">The archive is deleted from the server after <b id="ttl">—</b> minutes.</p>
+  </section>
+
+  <section id="failure" class="card" hidden>
+    <div class="fail-mark">!</div>
+    <h2>Conversion failed</h2>
+    <p id="failMessage" class="error"></p>
+    <button id="retry" class="ghost wide">Start over</button>
+  </section>
+
+  <footer class="foot">Runs entirely on your own server &middot; nothing is sent anywhere else.</footer>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,186 @@
+:root {
+  --bg: #0d1117;
+  --card: #161b22;
+  --card-2: #1c232c;
+  --line: #2a3038;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #4f8cff;
+  --accent-2: #7aa7ff;
+  --ok: #3fb950;
+  --bad: #f85149;
+  --radius: 14px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --card-2: #f0f3f8;
+    --line: #dfe4ec;
+    --text: #16202c;
+    --muted: #64707f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 32px 16px 48px;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.shell { max-width: 640px; margin: 0 auto; display: grid; gap: 20px; }
+
+.head { text-align: center; }
+.head h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: -0.02em; }
+.head .arrow { color: var(--accent); }
+.head p { margin: 0; color: var(--muted); }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 22px;
+  display: grid;
+  gap: 16px;
+}
+
+/* ── drop zone ─────────────────────────────────────────────────────── */
+.drop {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 34px 18px;
+  border: 2px dashed var(--line);
+  border-radius: var(--radius);
+  background: var(--card-2);
+  cursor: pointer;
+  text-align: center;
+  transition: border-color .15s, background .15s;
+}
+.drop:hover, .drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--card-2)); }
+.drop-icon { width: 34px; height: 34px; color: var(--accent); }
+.drop-title { font-size: 16px; }
+.drop-sub { color: var(--muted); font-size: 13px; }
+
+.chosen {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--card-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.file-icon { width: 24px; height: 24px; color: var(--accent); flex: none; }
+.chosen-meta { display: grid; min-width: 0; flex: 1; }
+.chosen-meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chosen-meta small { color: var(--muted); }
+
+/* ── options ───────────────────────────────────────────────────────── */
+.options { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.opt { display: grid; gap: 5px; }
+.opt label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+
+select {
+  appearance: none;
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--card-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  font: inherit;
+  cursor: pointer;
+}
+select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.check { display: flex; gap: 9px; align-items: flex-start; color: var(--muted); font-size: 13px; cursor: pointer; }
+.check input { margin-top: 3px; accent-color: var(--accent); }
+.check small { display: block; }
+
+/* ── buttons ───────────────────────────────────────────────────────── */
+button, .as-link {
+  font: inherit;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: background .15s, opacity .15s;
+}
+.primary {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  text-align: center;
+  text-decoration: none;
+  display: block;
+}
+.primary:hover:not(:disabled) { background: var(--accent-2); }
+.primary:disabled { opacity: .45; cursor: not-allowed; }
+.ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+.ghost:hover { color: var(--text); border-color: var(--muted); }
+.ghost.wide { width: 100%; }
+
+/* ── progress ──────────────────────────────────────────────────────── */
+.stage-row { display: flex; align-items: center; gap: 12px; }
+.stage-row > div { flex: 1; min-width: 0; display: grid; }
+.stage-row small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.percent { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.spinner {
+  width: 20px; height: 20px; flex: none;
+  border: 2.5px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.bar { height: 10px; background: var(--card-2); border-radius: 999px; overflow: hidden; }
+.bar-fill {
+  height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  border-radius: 999px;
+  transition: width .25s ease;
+}
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 10px; margin: 0; }
+.stats div { background: var(--card-2); border-radius: 9px; padding: 9px 10px; }
+.stats dt { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.stats dd { margin: 2px 0 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.logbox summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.logbox pre {
+  margin: 8px 0 0;
+  max-height: 190px;
+  overflow: auto;
+  background: var(--card-2);
+  border-radius: 9px;
+  padding: 10px 12px;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+
+/* ── result ────────────────────────────────────────────────────────── */
+#result, #failure { text-align: center; justify-items: center; }
+#result h2, #failure h2 { margin: 0; font-size: 20px; }
+.done-mark, .fail-mark {
+  width: 52px; height: 52px; border-radius: 50%;
+  display: grid; place-items: center;
+  font-size: 26px; font-weight: 700;
+}
+.done-mark { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.fail-mark { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+#result .primary, #result .ghost, #failure .ghost { width: 100%; }
+
+.muted { color: var(--muted); margin: 0; }
+.tiny { font-size: 12px; }
+.error { color: var(--bad); margin: 0; font-size: 14px; }
+.foot { text-align: center; color: var(--muted); font-size: 12px; }
