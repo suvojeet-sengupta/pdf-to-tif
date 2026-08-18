@@ -184,3 +184,6 @@ button, .as-link {
 .tiny { font-size: 12px; }
 .error { color: var(--bad); margin: 0; font-size: 14px; }
 .foot { text-align: center; color: var(--muted); font-size: 12px; }
+
+/* [hidden] must win over the display rules the cards set. */
+[hidden] { display: none !important; }
