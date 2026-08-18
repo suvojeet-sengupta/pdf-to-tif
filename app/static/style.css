@@ -539,3 +539,23 @@ input::placeholder { color: var(--text-dim); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ── boot failure notice (only ever visible if app.js never ran) ───────── */
+.bootfail {
+  max-width: 420px;
+  margin: 12vh auto;
+  padding: 20px;
+  background: var(--ink-2);
+  border: 1px solid var(--edge);
+  border-left: 3px solid var(--bad);
+  border-radius: 12px;
+  color: var(--text);
+}
+.bootfail b { display: block; margin-bottom: 8px; color: var(--bad); }
+.bootfail p { margin: 0 0 10px; color: var(--text-dim); font-size: 13.5px; }
+.bootfail code {
+  display: block;
+  font: 11.5px var(--mono);
+  color: var(--text-dim);
+  word-break: break-all;
+}

@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#12100e">
 <meta name="color-scheme" content="dark light">
 <title>Pagesmith · PDF to TIFF</title>
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/style.css?v=2">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23e8863a'/><path d='M9 8h9l5 5v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z' fill='%2318140f'/><path d='M11 17h10M11 21h7' stroke='%23e8863a' stroke-width='2' stroke-linecap='round'/></svg>">
 </head>
 <body>
@@ -223,6 +223,40 @@
   </footer>
 </div>
 
-<script src="/app.js"></script>
+<!-- If the scripts never boot the page would otherwise render empty, so say so. -->
+<div id="bootFail" class="bootfail" hidden>
+  <b>The interface could not start.</b>
+  <p>A cached copy of an older version is probably being served. Hard-refresh
+     the page (Ctrl/Cmd + Shift + R), and purge the cache for this hostname in
+     Cloudflare → Caching → Configuration → Purge Everything.</p>
+  <code id="bootFailWhy"></code>
+</div>
+<script>
+  (function () {
+    var shown = false;
+    function reveal(why) {
+      if (shown) return;
+      shown = true;
+      var box = document.getElementById('bootFail');
+      var why_ = document.getElementById('bootFailWhy');
+      if (why && why_) why_.textContent = why;
+      if (box) box.hidden = false;
+    }
+    window.addEventListener('error', function (e) {
+      var gate = document.getElementById('gate');
+      var work = document.getElementById('workspace');
+      if (gate && work && gate.hidden && work.hidden) {
+        reveal(e.message || 'script error');
+      }
+    }, true);
+    // Nothing visible a few seconds in means the app script never ran.
+    setTimeout(function () {
+      var gate = document.getElementById('gate');
+      var work = document.getElementById('workspace');
+      if (gate && work && gate.hidden && work.hidden) reveal('app.js did not start');
+    }, 5000);
+  })();
+</script>
+<script src="/app.js?v=2"></script>
 </body>
 </html>

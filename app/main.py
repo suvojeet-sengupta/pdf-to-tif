@@ -271,6 +271,23 @@ async def healthz() -> dict:
     return {"status": "ok"}
 
 
+@app.middleware("http")
+async def no_store_app_shell(request: Request, call_next):
+    """Keep index.html / app.js / style.css out of every cache.
+
+    Cloudflare caches .js and .css by file extension but leaves the HTML
+    alone, so after a redeploy a browser could pair new markup with a stale
+    script - which renders a blank page. The app is tiny and private, so
+    revalidating on every load costs nothing and removes the whole class of
+    problem. API responses set their own headers.
+    """
+    response = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 def _truthy(value: str) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
