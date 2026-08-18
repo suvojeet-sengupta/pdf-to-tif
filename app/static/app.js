@@ -53,6 +53,9 @@ const state = {
   uploadStart: 0,
   lastProgressAt: 0,
   stallTimer: null,
+  uploadId: null,
+  cancelled: false,
+  baseBytes: 0,
 };
 
 /* ── formatting ───────────────────────────────────────────────────────── */
@@ -200,76 +203,220 @@ document.addEventListener('drop', (e) => {
 el.start.addEventListener('click', startUpload);
 el.retryUpload.addEventListener('click', startUpload);
 
-function startUpload() {
-  if (!state.file || state.uploading) return;
+/* Uploads go up in chunks. A dropped chunk is retried on its own instead of
+   restarting the whole file, and the server's byte count - not the browser's
+   send buffer - drives the progress bar, so the number means something even
+   through a proxy. */
+const RESUME_KEY = 'pagesmith.upload';
+const MAX_CHUNK_ATTEMPTS = 6;
+const DEFAULT_CHUNK = 4 * 1024 * 1024;
 
-  const body = new FormData();
-  body.append('file', state.file);
-  body.append('dpi', el.dpi.value);
-  body.append('color_mode', el.color.value);
-  body.append('compression', el.compression.value);
-  body.append('zip_compress', el.zipCompress.checked ? 'true' : 'false');
-  body.append('auto_delete', el.autoDelete.checked ? 'true' : 'false');
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function detailText(data, fallback) {
+  const detail = data && data.detail;
+  if (typeof detail === 'string') return detail;
+  if (detail && typeof detail.message === 'string') return detail.message;
+  return fallback;
+}
+
+/* Remember an in-flight upload so picking the same file again resumes it. */
+function rememberUpload(id) {
+  try {
+    localStorage.setItem(RESUME_KEY, JSON.stringify({
+      id, name: state.file.name, size: state.file.size,
+    }));
+  } catch (_) { /* private mode - resume is simply unavailable */ }
+}
+
+function forgetUpload() {
+  try { localStorage.removeItem(RESUME_KEY); } catch (_) { /* ignore */ }
+}
+
+function rememberedUpload() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(RESUME_KEY) || 'null');
+    if (!saved || !state.file) return null;
+    if (saved.name !== state.file.name || saved.size !== state.file.size) return null;
+    return saved;
+  } catch (_) { return null; }
+}
+
+async function startUpload() {
+  if (!state.file || state.uploading) return;
+  const file = state.file;
 
   liveView('run');
-  resetRunView(`${state.file.name} · ${humanBytes(state.file.size)}`);
+  resetRunView(`${file.name} · ${humanBytes(file.size)}`);
   el.start.disabled = true;
   el.retryUpload.hidden = true;
 
   state.uploading = true;
+  state.cancelled = false;
   state.uploadStart = Date.now();
   state.lastProgressAt = Date.now();
+  state.baseBytes = 0;
   startStallWatch();
 
-  const xhr = new XMLHttpRequest();
-  state.xhr = xhr;
-  xhr.open('POST', '/api/upload');
-  xhr.timeout = 0;                       // large files over a tunnel take a while
+  try {
+    let session = null;
+    let offset = 0;
 
-  xhr.upload.addEventListener('progress', (e) => {
-    state.lastProgressAt = Date.now();
-    if (e.lengthComputable) paintUpload(e.loaded, e.total);
-  });
-  // Body fully handed to the network - the server is now reading it.
-  xhr.upload.addEventListener('load', () => {
-    state.lastProgressAt = Date.now();
+    // Same file as an interrupted transfer? Continue from the server's offset.
+    const previous = rememberedUpload();
+    if (previous) {
+      try {
+        session = await api(`/api/uploads/${previous.id}`);
+        offset = session.received || 0;
+        if (offset > 0) {
+          el.stageLabel.textContent = `Resuming from ${humanBytes(offset)}`;
+        }
+      } catch (_) {
+        session = null;                       // expired; start a fresh one
+      }
+    }
+
+    if (!session) {
+      session = await api('/api/uploads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          size: file.size,
+          dpi: Number(el.dpi.value),
+          color_mode: el.color.value,
+          compression: el.compression.value,
+          zip_compress: el.zipCompress.checked,
+          auto_delete: el.autoDelete.checked,
+        }),
+      });
+      offset = session.received || 0;
+    }
+
+    state.uploadId = session.upload_id;
+    state.baseBytes = offset;
+    rememberUpload(state.uploadId);
+    const chunkSize = session.chunk_size || DEFAULT_CHUNK;
+    paintUpload(offset, file.size);
+
+    while (offset < file.size) {
+      if (state.cancelled) throw Object.assign(new Error('cancelled'), { aborted: true });
+
+      let attempt = 0;
+      for (;;) {
+        const end = Math.min(offset + chunkSize, file.size);
+        try {
+          offset = await sendChunk(state.uploadId, file.slice(offset, end), offset, file.size);
+          break;
+        } catch (err) {
+          if (err.fatal) throw err;
+          attempt += 1;
+          if (attempt >= MAX_CHUNK_ATTEMPTS) throw err;
+          el.stageLabel.textContent =
+            `Connection problem — retrying (${attempt}/${MAX_CHUNK_ATTEMPTS - 1})`;
+          await sleep(Math.min(8000, 400 * 2 ** attempt));
+          if (state.cancelled) throw Object.assign(new Error('cancelled'), { aborted: true });
+          // The chunk may have landed before the link died - resync and go on.
+          try { offset = (await api(`/api/uploads/${state.uploadId}`)).received; }
+          catch (_) { /* keep the offset we have and retry it */ }
+          if (offset >= file.size) break;
+        }
+      }
+      paintUpload(offset, file.size);
+    }
+
     paintHandoff();
-  });
-
-  xhr.addEventListener('load', () => {
+    const created = await api(`/api/uploads/${state.uploadId}/finish`, { method: 'POST' });
+    forgetUpload();
+    state.uploadId = null;
+    state.jobId = created.job_id;
     finishUpload();
-    let data = {};
-    try { data = JSON.parse(xhr.responseText); } catch (_) { /* handled below */ }
-    if (xhr.status === 401) return showGate();
-    if (xhr.status >= 200 && xhr.status < 300 && data.job_id) {
-      state.jobId = data.job_id;
-      watch(data.job_id);
-      refreshLibrary();
-    } else {
-      showUploadFailure(data.detail || uploadErrorFor(xhr.status), true);
-    }
-  });
-  xhr.addEventListener('error', () => {
+    watch(created.job_id);
+    refreshLibrary();
+  } catch (err) {
     finishUpload();
-    showUploadFailure(
-      'The connection dropped while uploading. Nothing was saved on the server.',
-      true,
-    );
-  });
-  xhr.addEventListener('abort', () => {
-    finishUpload();
-    if (state.aborting === 'stall') {
-      showUploadFailure(
-        'Upload stalled — no data moved for 45 seconds. Check the connection and try again.',
-        true,
-      );
-    } else {
+    if (err.auth || err.message === 'unauthenticated') return;   // gate already shown
+    if (err.aborted || state.cancelled) {
+      await discardUpload();
       backToIdle();
+      return;
     }
-    state.aborting = null;
-  });
+    showUploadFailure(uploadMessage(err), true);
+  }
+}
 
-  xhr.send(body);
+function sendChunk(uploadId, blob, offset, total) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    state.xhr = xhr;
+    xhr.open('PATCH', `/api/uploads/${uploadId}`);
+    xhr.setRequestHeader('X-Offset', String(offset));
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+    xhr.upload.onprogress = (event) => {
+      state.lastProgressAt = Date.now();
+      if (event.lengthComputable) paintUpload(offset + event.loaded, total);
+    };
+
+    xhr.onload = () => {
+      state.xhr = null;
+      state.lastProgressAt = Date.now();
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch (_) { /* below */ }
+
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(data.received);
+      if (xhr.status === 401) {
+        showGate();
+        return reject(Object.assign(new Error('unauthenticated'), { fatal: true, auth: true }));
+      }
+      // 409 means the server is at a different offset; it tells us which.
+      if (xhr.status === 409 && data.detail && typeof data.detail.received === 'number') {
+        return resolve(data.detail.received);
+      }
+      if ([400, 404, 409, 413].includes(xhr.status)) {
+        return reject(Object.assign(
+          new Error(detailText(data, `Upload rejected (HTTP ${xhr.status}).`)),
+          { fatal: true },
+        ));
+      }
+      reject(new Error(detailText(data, `HTTP ${xhr.status}`)));
+    };
+
+    xhr.onerror = () => { state.xhr = null; reject(new Error('network')); };
+    xhr.ontimeout = () => { state.xhr = null; reject(new Error('timeout')); };
+    xhr.onabort = () => {
+      state.xhr = null;
+      // A stall abort should retry the chunk; a user cancel should not.
+      if (state.cancelled) {
+        reject(Object.assign(new Error('cancelled'), { aborted: true, fatal: true }));
+      } else {
+        reject(new Error('stalled'));
+      }
+    };
+
+    xhr.send(blob);
+  });
+}
+
+async function discardUpload() {
+  if (!state.uploadId) return;
+  const id = state.uploadId;
+  state.uploadId = null;
+  forgetUpload();
+  try { await api(`/api/uploads/${id}`, { method: 'DELETE' }); } catch (_) { /* ignore */ }
+}
+
+function uploadMessage(err) {
+  const raw = err && err.message ? err.message : '';
+  if (raw === 'network' || raw === 'stalled' || raw === 'timeout') {
+    return 'The connection kept failing while uploading. Your progress is held '
+         + 'on the server — pick the same file again to resume where it stopped.';
+  }
+  if (/413|larger than/i.test(raw)) {
+    return `${raw} Cloudflare's free plan also caps a single request at 100 MB, `
+         + 'which the chunked upload stays under.';
+  }
+  return raw || 'The upload failed.';
 }
 
 function finishUpload() {
@@ -285,27 +432,15 @@ function startStallWatch() {
   state.stallTimer = setInterval(() => {
     if (!state.uploading) return;
     if (Date.now() - state.lastProgressAt > STALL_AFTER_MS && state.xhr) {
-      state.aborting = 'stall';
-      state.xhr.abort();
+      state.xhr.abort();        // retried by the chunk loop, not fatal
     }
   }, 5000);
-}
-
-function uploadErrorFor(status) {
-  if (status === 413) {
-    return 'The server rejected the file as too large. Note that Cloudflare\'s '
-         + 'free plan also caps uploads at 100 MB.';
-  }
-  if (status === 0) return 'The upload was interrupted before it reached the server.';
-  if (status === 502 || status === 503 || status === 504) {
-    return `The tunnel or server did not respond (HTTP ${status}). It may still be starting up.`;
-  }
-  return `Upload failed (HTTP ${status}).`;
 }
 
 function showUploadFailure(message, offerRetry) {
   el.failMessage.textContent = message;
   el.retryUpload.hidden = !offerRetry || !state.file;
+  el.retryUpload.textContent = state.uploadId ? 'Resume upload' : 'Try again';
   liveView('fail');
 }
 
@@ -331,7 +466,8 @@ function statLabels(a, b, c, d, e) {
 function paintUpload(loaded, total) {
   const pct = total ? (loaded / total) * 100 : 0;
   const elapsed = (Date.now() - state.uploadStart) / 1000;
-  const rate = elapsed > 0.4 ? loaded / elapsed : 0;      // bytes per second
+  const moved = Math.max(0, loaded - (state.baseBytes || 0));
+  const rate = elapsed > 0.4 ? moved / elapsed : 0;       // bytes per second
   const left = rate > 0 ? (total - loaded) / rate : 0;
 
   el.stageLabel.textContent = 'Uploading to the server';
@@ -454,9 +590,9 @@ function showFailure(message) {
 el.cancel.addEventListener('click', async () => {
   el.cancel.disabled = true;
   el.cancel.textContent = 'Cancelling…';
-  if (state.uploading && state.xhr) {
-    state.aborting = 'user';
-    state.xhr.abort();
+  if (state.uploading) {
+    state.cancelled = true;
+    if (state.xhr) state.xhr.abort();
     return;
   }
   if (state.jobId) {

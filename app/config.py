@@ -30,7 +30,7 @@ RENDER_WORKERS = max(1, _int("RENDER_WORKERS", min(8, (os.cpu_count() or 2))))
 # Hard limits so a single upload cannot exhaust the VPS.
 MAX_UPLOAD_MB = _int("MAX_UPLOAD_MB", 500)
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-MAX_PAGES = _int("MAX_PAGES", 3000)
+MAX_PAGES = _int("MAX_PAGES", 10000)
 
 # How long a finished job (and its zip) stays on disk before being deleted.
 JOB_TTL_MINUTES = _int("JOB_TTL_MINUTES", 120)
@@ -79,3 +79,28 @@ LOGIN_LOCKOUT_SECONDS = _int("LOGIN_LOCKOUT_SECONDS", 300)
 LIBRARY_LIMIT = _int("LIBRARY_LIMIT", 40)
 
 APP_NAME = os.environ.get("APP_NAME", "Pagesmith").strip() or "Pagesmith"
+
+# ---------------------------------------------------------------------------
+# Large-document safety rails
+# ---------------------------------------------------------------------------
+# Pages in flight per worker. Bounding this keeps a 10 000 page job from
+# queueing 10 000 pickled tasks at once, and makes cancellation immediate.
+INFLIGHT_PER_WORKER = max(1, _int("INFLIGHT_PER_WORKER", 3))
+
+# Abort a job rather than filling the disk. Checked while rendering.
+MIN_FREE_DISK_MB = _int("MIN_FREE_DISK_MB", 1024)
+DISK_CHECK_EVERY = _int("DISK_CHECK_EVERY", 25)
+
+# A single page that renders to more than this many pixels is scaled down
+# instead of exhausting the worker's memory (a 600 dpi A0 sheet is ~1.4 GB).
+MAX_PAGE_PIXELS = _int("MAX_PAGE_PIXELS", 120_000_000)
+
+# ---------------------------------------------------------------------------
+# Chunked uploads
+# ---------------------------------------------------------------------------
+UPLOADS_DIR = DATA_DIR / "uploads"
+UPLOAD_CHUNK_BYTES = _int("UPLOAD_CHUNK_MB", 4) * 1024 * 1024
+# An unfinished upload is discarded after this long without activity.
+UPLOAD_TTL_MINUTES = _int("UPLOAD_TTL_MINUTES", 180)
+
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)

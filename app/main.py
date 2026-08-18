@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -12,9 +13,10 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, Up
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+from pydantic import BaseModel, Field
 from starlette.requests import ClientDisconnect
 
-from . import auth, config
+from . import auth, config, uploads
 from .converter import normalise_options
 from .jobs import manager
 
@@ -68,6 +70,9 @@ async def _cleanup_loop() -> None:
             removed = await asyncio.to_thread(manager.cleanup)
             if removed:
                 log.info("cleaned up %d expired job(s)", removed)
+            dropped = await asyncio.to_thread(uploads.store.cleanup)
+            if dropped:
+                log.info("discarded %d abandoned upload(s)", dropped)
         except Exception:  # noqa: BLE001
             log.exception("cleanup failed")
         await asyncio.sleep(config.CLEANUP_INTERVAL_SECONDS)
@@ -93,6 +98,7 @@ async def api_config(request: Request) -> dict:
         "max_dpi": config.MAX_DPI,
         "render_workers": config.RENDER_WORKERS,
         "job_ttl_minutes": config.JOB_TTL_MINUTES,
+        "chunk_size": config.UPLOAD_CHUNK_BYTES,
     }
 
 
@@ -190,6 +196,119 @@ async def upload(
     manager.submit(job)
     log.info("job %s accepted (%s, %.1f MB)", job.id, filename, written / 1024 / 1024)
     return JSONResponse({"job_id": job.id, "status_url": f"/api/events/{job.id}"})
+
+
+class UploadInit(BaseModel):
+    filename: str
+    size: int = Field(gt=0)
+    dpi: int = config.DEFAULT_DPI
+    color_mode: str = "color"
+    compression: str = "lzw"
+    zip_compress: bool = False
+    auto_delete: bool = False
+
+
+@app.post("/api/uploads", dependencies=[Guarded])
+async def upload_begin(body: UploadInit) -> dict:
+    """Open a resumable upload and hand back the chunk size to send."""
+    if not body.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a .pdf file.")
+
+    dpi, color_mode, compression = normalise_options(
+        body.dpi, body.color_mode, body.compression,
+        config.MIN_DPI, config.MAX_DPI, config.DEFAULT_DPI,
+    )
+    options = {
+        "dpi": dpi,
+        "color_mode": color_mode,
+        "compression": compression,
+        "zip_compress": body.zip_compress,
+        "auto_delete": body.auto_delete,
+    }
+    try:
+        upload = uploads.store.begin(body.filename.strip(), body.size, options)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    return upload.state()
+
+
+@app.get("/api/uploads/{upload_id}", dependencies=[Guarded])
+async def upload_state(upload_id: str) -> dict:
+    """How many bytes the server holds - the client resumes from here."""
+    try:
+        return uploads.store.get(upload_id).state()
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/uploads/{upload_id}", dependencies=[Guarded])
+async def upload_chunk(upload_id: str, request: Request) -> dict:
+    """Append one chunk at the offset named by the X-Offset header."""
+    try:
+        offset = int(request.headers.get("x-offset", "-1"))
+    except ValueError:
+        offset = -1
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="Missing or invalid X-Offset header.")
+
+    try:
+        chunk = await request.body()
+    except ClientDisconnect:
+        raise HTTPException(status_code=499, detail="Chunk aborted.") from None
+    if not chunk:
+        raise HTTPException(status_code=400, detail="Empty chunk.")
+    if len(chunk) > config.UPLOAD_CHUNK_BYTES * 2:
+        raise HTTPException(status_code=413, detail="Chunk is too large.")
+
+    try:
+        upload = uploads.store.append(upload_id, offset, chunk)
+    except uploads.UploadError as exc:
+        # 409 carries the server's real offset so the client can resync.
+        status = 404 if "expired" in str(exc) else 409
+        detail = str(exc)
+        if status == 409:
+            try:
+                detail = {"message": detail, "received": uploads.store.get(upload_id).received}
+            except uploads.UploadError:
+                pass
+        raise HTTPException(status_code=status, detail=detail) from exc
+    return upload.state()
+
+
+@app.post("/api/uploads/{upload_id}/finish", dependencies=[Guarded])
+async def upload_finish(upload_id: str) -> JSONResponse:
+    """Turn a completed upload into a conversion job."""
+    try:
+        upload = uploads.store.finish(upload_id)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    job = manager.create(
+        original_name=upload.filename,
+        dpi=upload.options["dpi"],
+        color_mode=upload.options["color_mode"],
+        compression=upload.options["compression"],
+        zip_compress=upload.options["zip_compress"],
+        auto_delete=upload.options["auto_delete"],
+    )
+    try:
+        # Same filesystem, so this is a rename rather than a second copy.
+        os.replace(upload.path, job.pdf_path)
+    except OSError as exc:
+        shutil.rmtree(job.dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Could not store the upload: {exc}") from exc
+    finally:
+        uploads.store.discard(upload_id)
+
+    manager.submit(job)
+    log.info("job %s accepted from upload %s (%s)", job.id, upload_id, upload.filename)
+    return JSONResponse({"job_id": job.id, "status_url": f"/api/events/{job.id}"})
+
+
+@app.delete("/api/uploads/{upload_id}", dependencies=[Guarded])
+async def upload_abort(upload_id: str) -> dict:
+    uploads.store.discard(upload_id)
+    return {"discarded": True}
 
 
 @app.get("/api/jobs", dependencies=[Guarded])

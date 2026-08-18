@@ -42,6 +42,7 @@ class RenderSpec:
     color_mode: str
     compression: str
     pad: int
+    max_pixels: int = 120_000_000
 
 
 def normalise_options(dpi, color_mode, compression, min_dpi, max_dpi, default_dpi):
@@ -85,6 +86,13 @@ def render_page(spec: RenderSpec, page_index: int) -> tuple[int, str, int]:
     page = doc.load_page(page_index)
 
     zoom = spec.dpi / 72.0
+    # Very large sheets at high DPI can ask for gigabytes of pixmap. Scale the
+    # zoom down to a sane ceiling rather than letting the worker die.
+    rect = page.rect
+    pixels = (rect.width * zoom) * (rect.height * zoom)
+    if spec.max_pixels and pixels > spec.max_pixels:
+        zoom *= (spec.max_pixels / pixels) ** 0.5
+
     matrix = fitz.Matrix(zoom, zoom)
     grayscale = spec.color_mode in ("gray", "bw")
     colorspace = fitz.csGRAY if grayscale else fitz.csRGB
@@ -106,11 +114,12 @@ def render_page(spec: RenderSpec, page_index: int) -> tuple[int, str, int]:
     out_path = os.path.join(spec.out_dir, filename)
 
     buffer = io.BytesIO()
+    effective_dpi = max(1, round(72 * zoom))
     image.save(
         buffer,
         format="TIFF",
         compression=compression,
-        dpi=(spec.dpi, spec.dpi),
+        dpi=(effective_dpi, effective_dpi),
     )
     data = buffer.getvalue()
     with open(out_path, "wb") as handle:

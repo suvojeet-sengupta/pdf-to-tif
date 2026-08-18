@@ -9,10 +9,11 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import (
+    FIRST_COMPLETED,
     Future,
     ProcessPoolExecutor,
     ThreadPoolExecutor,
-    as_completed,
+    wait,
 )
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -241,13 +242,9 @@ class JobManager:
             job.update(total_pages=page_count, stage="rendering")
             job.note(f"{page_count} page(s) detected - rendering at {job.dpi} DPI")
 
-            self._render_all(job)
+            zip_path = self._render_and_pack(job)
             if job.cancel_requested:
                 raise JobCancelled()
-
-            job.update(stage="packaging")
-            job.note("Packing TIFF files into a ZIP archive")
-            zip_path = self._build_zip(job)
 
             job.update(
                 stage="done",
@@ -271,56 +268,95 @@ class JobManager:
             job.note(f"Error: {exc}")
             self._discard_workdir(job)
 
-    def _render_all(self, job: Job) -> None:
+    def _render_and_pack(self, job: Job) -> Path:
+        """Render every page and stream it straight into the archive.
+
+        Pages are added to the ZIP and deleted as soon as they are rendered,
+        so peak disk usage stays at roughly one copy of the output instead of
+        two, and there is no long silent packaging phase at the end - which on
+        a 10 000 page document looked exactly like the job had hung.
+        """
         assert self._pool is not None
         out_dir = job.dir / "tif"
+        stem = _safe_stem(job.original_name)
+        zip_path = job.dir / f"{stem}_tiff.zip"
         pad = max(3, len(str(job.total_pages)))
         spec = RenderSpec(
             pdf_path=str(job.pdf_path),
             out_dir=str(out_dir),
-            prefix=_safe_stem(job.original_name),
+            prefix=stem,
             dpi=job.dpi,
             color_mode=job.color_mode,
             compression=job.compression,
             pad=pad,
+            max_pixels=config.MAX_PAGE_PIXELS,
         )
 
-        futures: list[Future] = [
-            self._pool.submit(render_page, spec, index)
-            for index in range(job.total_pages)
-        ]
-        pending = set(futures)
-        step = max(1, job.total_pages // 20)
-        try:
-            # as_completed keeps the progress bar moving as soon as any worker
-            # finishes, rather than stalling behind one slow page.
-            for future in as_completed(futures):
-                pending.discard(future)
-                if job.cancel_requested:
-                    raise JobCancelled()
-                _index, _filename, written = future.result()
+        mode = zipfile.ZIP_DEFLATED if job.zip_compress else zipfile.ZIP_STORED
+        # Stored is the default: the TIFFs are already compressed, so skipping
+        # deflate makes packaging effectively free.
+        step = max(1, min(50, job.total_pages // 20 or 1))
+
+        with zipfile.ZipFile(zip_path, "w", compression=mode, allowZip64=True) as archive:
+            for filename, written in self._render_stream(job, spec):
+                page_file = out_dir / filename
+                archive.write(page_file, arcname=filename)
+                page_file.unlink(missing_ok=True)
+
                 done, total_bytes = job.bump_page(written)
                 if done == 1 or done % step == 0 or done == job.total_pages:
                     job.note(
                         f"Converted {done}/{job.total_pages} pages "
                         f"({_human(total_bytes)})"
                     )
+                if done % config.DISK_CHECK_EVERY == 0:
+                    self._check_disk(job)
+
+        job.update(stage="packaging")
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return zip_path
+
+    def _render_stream(self, job: Job, spec: RenderSpec):
+        """Yield (filename, bytes) per page, keeping only a few pages in flight.
+
+        Submitting all 10 000 tasks up front would pickle and queue the lot,
+        and cancelling would have to walk every one of them. A sliding window
+        keeps memory flat and stops the moment a cancel arrives.
+        """
+        assert self._pool is not None
+        window = max(2, config.RENDER_WORKERS * config.INFLIGHT_PER_WORKER)
+        next_page = 0
+        pending: set[Future] = set()
+
+        def fill() -> None:
+            nonlocal next_page
+            while len(pending) < window and next_page < job.total_pages:
+                pending.add(self._pool.submit(render_page, spec, next_page))
+                next_page += 1
+
+        try:
+            fill()
+            while pending:
+                if job.cancel_requested:
+                    raise JobCancelled()
+                finished, _ = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    pending.discard(future)
+                    _index, filename, written = future.result()
+                    yield filename, written
+                fill()
         finally:
             for future in pending:
                 future.cancel()
 
-    def _build_zip(self, job: Job) -> Path:
-        tif_dir = job.dir / "tif"
-        zip_path = job.dir / f"{_safe_stem(job.original_name)}_tiff.zip"
-        mode = zipfile.ZIP_DEFLATED if job.zip_compress else zipfile.ZIP_STORED
-        # Stored is the default: the TIFFs are already compressed, so skipping
-        # deflate makes packaging effectively instant.
-        with zipfile.ZipFile(zip_path, "w", compression=mode, allowZip64=True) as archive:
-            for path in sorted(tif_dir.iterdir()):
-                if job.cancel_requested:
-                    raise JobCancelled()
-                archive.write(path, arcname=path.name)
-        return zip_path
+    def _check_disk(self, job: Job) -> None:
+        free_mb = shutil.disk_usage(job.dir).free // (1024 * 1024)
+        if free_mb < config.MIN_FREE_DISK_MB:
+            raise RuntimeError(
+                f"Stopped at page {job.done_pages} of {job.total_pages}: only "
+                f"{free_mb} MB of disk left. Try a lower DPI, grayscale, or "
+                f"bilevel output."
+            )
 
     def _discard_workdir(self, job: Job) -> None:
         shutil.rmtree(job.dir, ignore_errors=True)

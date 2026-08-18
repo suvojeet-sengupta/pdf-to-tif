@@ -21,13 +21,20 @@ you land straight back on the running progress view.
 
 - **Password protected** — one shared password, signed session cookie, per-IP lockout after repeated failures
 - Drag-and-drop upload with real upload progress
+- **Chunked resumable uploads** — the file is sent a few megabytes at a time; if a
+  chunk fails only that chunk is retried (with exponential backoff), and reloading the
+  page resumes from the server's last confirmed byte instead of starting over
 - One TIFF per PDF page, named `<document>_page_001.tif`, `…_002.tif`, …
 - Live progress over Server-Sent Events: page mosaic, %, pages/sec, ETA, activity log
 - **Server-side jobs** — reload the page or open it on your phone and the running conversion is still there
 - **Library** of everything still on the server, with re-download and one-click delete
 - **Delete after download** — tick the box and the archive is wiped the moment the download finishes
+- **Streaming ZIP** — each page is added to the archive and deleted from disk as soon
+  as it renders, so peak disk usage stays flat even for 10 000-page documents
 - ZIP stored rather than deflated → fast, since TIFFs are already compressed
 - Resolution 100–600 DPI, colour / grayscale / bilevel (CCITT G4)
+- **Large-document safety rails** — sliding render window, per-page pixel cap, periodic
+  disk-space checks, and a configurable page-count ceiling
 - Cancel a running job; finished archives expire automatically
 - Finished archives survive a container restart
 - Responsive UI built for phone and desktop, light and dark
@@ -136,8 +143,9 @@ sudo systemctl status cloudflared
 Two things worth setting in the Cloudflare dashboard for that hostname:
 
 - **Speed → Optimization**: leave Rocket Loader **off** (it can break the SSE client).
-- Free plans cap uploads at **100 MB** per request. If you need larger PDFs,
-  either use a paid plan or point the tunnel at the app and upload over the LAN.
+- Free plans cap uploads at **100 MB** per request. The chunked uploader sends
+  4 MB chunks by default, which stays well under this cap — even 500 MB PDFs
+  work fine on the free plan.
 
 ---
 
@@ -160,11 +168,17 @@ All settings are environment variables — set them in `docker-compose.yml`.
 | `RENDER_WORKERS` | `min(8, cores)` | Worker processes rendering pages in parallel |
 | `MAX_CONCURRENT_JOBS` | `2` | How many PDFs may convert at the same time |
 | `MAX_UPLOAD_MB` | `500` | Rejected above this size |
-| `MAX_PAGES` | `3000` | Page-count ceiling per PDF |
+| `MAX_PAGES` | `10000` | Page-count ceiling per PDF |
 | `JOB_TTL_MINUTES` | `120` | How long a finished ZIP stays downloadable |
 | `DEFAULT_DPI` | `200` | Resolution preselected in the UI |
 | `MAX_DPI` | `600` | Highest resolution a user may pick |
 | `DATA_DIR` | `/data` | Where jobs and archives are written |
+| `UPLOAD_CHUNK_MB` | `4` | Chunk size for resumable uploads (MB) |
+| `UPLOAD_TTL_MINUTES` | `180` | Abandoned uploads are cleaned up after this |
+| `INFLIGHT_PER_WORKER` | `3` | Render tasks queued per worker (sliding window) |
+| `MIN_FREE_DISK_MB` | `1024` | Abort a job if free disk drops below this |
+| `DISK_CHECK_EVERY` | `25` | Check free disk space every N pages |
+| `MAX_PAGE_PIXELS` | `120000000` | Scale down pages exceeding this pixel count |
 
 ### Tuning
 
@@ -173,6 +187,9 @@ All settings are environment variables — set them in `docker-compose.yml`.
 - **Smaller output**: *Deflate* TIFF compression, or *Black & white* which is
   dramatically smaller than colour.
 - **Largest / fastest per page**: *PackBits*, or *None* for raw uncompressed TIFF.
+- **Large documents**: the render window (`INFLIGHT_PER_WORKER × RENDER_WORKERS`)
+  keeps memory flat. Raise `INFLIGHT_PER_WORKER` for higher throughput on fast disks,
+  lower it on memory-constrained boxes.
 
 ---
 
@@ -181,27 +198,64 @@ All settings are environment variables — set them in `docker-compose.yml`.
 Every endpoint below except `/api/config`, `/api/login` and `/healthz` requires
 the session cookie.
 
+### Single-request upload (legacy)
+
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/login` | form field `password` → sets the session cookie |
-| `POST` | `/api/logout` | clears the session cookie |
 | `POST` | `/api/upload` | multipart: `file`, `dpi`, `color_mode`, `compression`, `zip_compress`, `auto_delete` → `{job_id}` |
+
+### Chunked resumable upload
+
+The browser sends the file a few megabytes at a time. If a chunk fails, only
+that chunk is retried (with exponential backoff). A page reload resumes from
+the server's confirmed byte offset instead of starting over.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/uploads` | JSON body: `{filename, size, dpi, color_mode, compression, zip_compress, auto_delete}` → `{upload_id, chunk_size, received}` |
+| `GET` | `/api/uploads/{id}` | Current byte offset — the client resumes from here |
+| `PATCH` | `/api/uploads/{id}` | Send one chunk as `application/octet-stream`, header `X-Offset: <n>` → `{received}` |
+| `POST` | `/api/uploads/{id}/finish` | Promote a complete upload to a conversion job → `{job_id}` |
+| `DELETE` | `/api/uploads/{id}` | Discard an incomplete upload |
+
+### Jobs and events
+
+| Method | Path | Purpose |
+| --- | --- | --- |
 | `GET` | `/api/jobs` | Everything the server still holds (running + finished) |
 | `DELETE` | `/api/jobs/{job_id}` | Delete a job and its archive from the server |
 | `GET` | `/api/events/{job_id}` | SSE stream of progress snapshots |
 | `GET` | `/api/status/{job_id}` | One-shot progress snapshot (polling fallback) |
 | `POST` | `/api/cancel/{job_id}` | Cancel a running job |
 | `GET` | `/api/download/{job_id}` | Download the finished ZIP |
+
+### Other
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/login` | form field `password` → sets the session cookie |
+| `POST` | `/api/logout` | clears the session cookie |
 | `GET` | `/api/config` | Limits the UI reads at boot |
 | `GET` | `/healthz` | Health probe |
 
-Convert from the command line:
+### Command-line example
 
 ```bash
+# Log in
 curl -s -c jar -F password='your-password' http://localhost:9000/api/login
 
+# Simple upload (small files)
 JOB=$(curl -s -b jar -F file=@input.pdf -F dpi=200 -F color_mode=color \
       http://localhost:9000/api/upload | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
+
+# Chunked upload (large files)
+UPLOAD=$(curl -s -b jar -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"filename":"input.pdf","size":'$(stat -c%s input.pdf)'}' \
+  http://localhost:9000/api/uploads | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["upload_id"],d["chunk_size"])')
+# ... then send chunks with PATCH and finish with POST /api/uploads/{id}/finish
+
+# Watch + download
 curl -N  -b jar http://localhost:9000/api/events/$JOB        # watch progress
 curl -OJ -b jar http://localhost:9000/api/download/$JOB      # grab the archive
 curl -X DELETE -b jar http://localhost:9000/api/jobs/$JOB    # wipe it from the server
@@ -221,16 +275,25 @@ DATA_DIR=./data APP_PASSWORD=dev COOKIE_SECURE=false \
 ## How it works
 
 ```
-upload  ──▶  PyMuPDF opens the PDF, page count is read
-             │
-             ├─▶ ProcessPoolExecutor renders N pages at once
-             │     page → pixmap → Pillow → page_0001.tif
-             │     each finished page bumps the live counter
-             │
-             └─▶ zipfile (ZIP_STORED) packs the TIFFs
-                   │
-                   └─▶ download link, deleted after JOB_TTL_MINUTES
-                       or immediately, if "delete after download" is on
+browser slices file into 4 MB chunks
+  │
+  ├─▶ POST /api/uploads          → server creates session, returns upload_id
+  │
+  ├─▶ PATCH /api/uploads/{id}    → each chunk appended at X-Offset
+  │     ↓ failure?  retry that chunk (exponential backoff)
+  │     ↓ reload?   GET /api/uploads/{id} → resume from server's offset
+  │
+  └─▶ POST /api/uploads/{id}/finish  → all bytes arrived, start conversion
+       │
+       ├─▶ PyMuPDF opens the PDF, page count is read
+       │
+       ├─▶ ProcessPoolExecutor renders N pages at once (sliding window)
+       │     page → pixmap → Pillow → page_0001.tif
+       │     each finished page → added to ZIP, deleted from disk
+       │     progress pushed to browsers via SSE
+       │
+       └─▶ download link, deleted after JOB_TTL_MINUTES
+             or immediately, if "delete after download" is on
 ```
 
 Job state lives in memory, so the container runs a single uvicorn worker; the
@@ -238,6 +301,10 @@ CPU-heavy work is what fans out across processes. Finished jobs also write a
 small `meta.json` next to their archive, which is how the library is rebuilt
 after a restart. Browsers hold no job state at all — they ask `/api/jobs` on
 load, so any device with the password sees the same conversions.
+
+Pages are added to the ZIP archive and deleted from disk as each one finishes
+rendering, so peak disk usage stays at roughly one copy of the output rather
+than two — and there is no long silent "packaging" phase at the end.
 
 ## Licence
 
