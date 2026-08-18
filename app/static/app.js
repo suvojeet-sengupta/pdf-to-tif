@@ -24,6 +24,8 @@ const el = {
   barFill: $('barFill'), mosaic: $('mosaic'), log: $('log'), cancel: $('cancel'),
   statPages: $('statPages'), statRate: $('statRate'), statElapsed: $('statElapsed'),
   statEta: $('statEta'), statSize: $('statSize'),
+  dtPages: $('dtPages'), dtRate: $('dtRate'), dtElapsed: $('dtElapsed'),
+  dtEta: $('dtEta'), dtSize: $('dtSize'), retryUpload: $('retryUpload'),
   resultTitle: $('resultTitle'), resultSummary: $('resultSummary'),
   download: $('download'), autoNote: $('autoNote'), again: $('again'),
   dropServer: $('dropServer'), failMessage: $('failMessage'), retry: $('retry'),
@@ -33,6 +35,7 @@ const el = {
 
 const MOSAIC_LIMIT = 400;      // beyond this the tile grid stops being readable
 const LIBRARY_POLL_MS = 4000;
+const STALL_AFTER_MS = 45000;  // no upload progress for this long = dead link
 
 const state = {
   file: null,
@@ -43,6 +46,13 @@ const state = {
   mosaicFor: 0,
   maxUploadBytes: 500 * 1024 * 1024,
   attached: false,
+  // Upload bookkeeping. `uploading` also stops the library poll from
+  // resetting the view out from under an upload in flight.
+  uploading: false,
+  xhr: null,
+  uploadStart: 0,
+  lastProgressAt: 0,
+  stallTimer: null,
 };
 
 /* ── formatting ───────────────────────────────────────────────────────── */
@@ -187,8 +197,11 @@ document.addEventListener('drop', (e) => {
 });
 
 /* ── starting a conversion ────────────────────────────────────────────── */
-el.start.addEventListener('click', () => {
-  if (!state.file) return;
+el.start.addEventListener('click', startUpload);
+el.retryUpload.addEventListener('click', startUpload);
+
+function startUpload() {
+  if (!state.file || state.uploading) return;
 
   const body = new FormData();
   body.append('file', state.file);
@@ -201,14 +214,30 @@ el.start.addEventListener('click', () => {
   liveView('run');
   resetRunView(`${state.file.name} · ${humanBytes(state.file.size)}`);
   el.start.disabled = true;
+  el.retryUpload.hidden = true;
+
+  state.uploading = true;
+  state.uploadStart = Date.now();
+  state.lastProgressAt = Date.now();
+  startStallWatch();
 
   const xhr = new XMLHttpRequest();
+  state.xhr = xhr;
   xhr.open('POST', '/api/upload');
+  xhr.timeout = 0;                       // large files over a tunnel take a while
+
   xhr.upload.addEventListener('progress', (e) => {
-    if (e.lengthComputable) paintUpload(e.loaded / e.total);
+    state.lastProgressAt = Date.now();
+    if (e.lengthComputable) paintUpload(e.loaded, e.total);
   });
+  // Body fully handed to the network - the server is now reading it.
+  xhr.upload.addEventListener('load', () => {
+    state.lastProgressAt = Date.now();
+    paintHandoff();
+  });
+
   xhr.addEventListener('load', () => {
-    el.start.disabled = false;
+    finishUpload();
     let data = {};
     try { data = JSON.parse(xhr.responseText); } catch (_) { /* handled below */ }
     if (xhr.status === 401) return showGate();
@@ -217,15 +246,68 @@ el.start.addEventListener('click', () => {
       watch(data.job_id);
       refreshLibrary();
     } else {
-      showFailure(data.detail || `Upload failed (HTTP ${xhr.status}).`);
+      showUploadFailure(data.detail || uploadErrorFor(xhr.status), true);
     }
   });
   xhr.addEventListener('error', () => {
-    el.start.disabled = false;
-    showFailure('Upload failed — the connection dropped.');
+    finishUpload();
+    showUploadFailure(
+      'The connection dropped while uploading. Nothing was saved on the server.',
+      true,
+    );
   });
+  xhr.addEventListener('abort', () => {
+    finishUpload();
+    if (state.aborting === 'stall') {
+      showUploadFailure(
+        'Upload stalled — no data moved for 45 seconds. Check the connection and try again.',
+        true,
+      );
+    } else {
+      backToIdle();
+    }
+    state.aborting = null;
+  });
+
   xhr.send(body);
-});
+}
+
+function finishUpload() {
+  state.uploading = false;
+  state.xhr = null;
+  el.start.disabled = !state.file;
+  clearInterval(state.stallTimer);
+  state.stallTimer = null;
+}
+
+function startStallWatch() {
+  clearInterval(state.stallTimer);
+  state.stallTimer = setInterval(() => {
+    if (!state.uploading) return;
+    if (Date.now() - state.lastProgressAt > STALL_AFTER_MS && state.xhr) {
+      state.aborting = 'stall';
+      state.xhr.abort();
+    }
+  }, 5000);
+}
+
+function uploadErrorFor(status) {
+  if (status === 413) {
+    return 'The server rejected the file as too large. Note that Cloudflare\'s '
+         + 'free plan also caps uploads at 100 MB.';
+  }
+  if (status === 0) return 'The upload was interrupted before it reached the server.';
+  if (status === 502 || status === 503 || status === 504) {
+    return `The tunnel or server did not respond (HTTP ${status}). It may still be starting up.`;
+  }
+  return `Upload failed (HTTP ${status}).`;
+}
+
+function showUploadFailure(message, offerRetry) {
+  el.failMessage.textContent = message;
+  el.retryUpload.hidden = !offerRetry || !state.file;
+  liveView('fail');
+}
 
 function resetRunView(label) {
   el.fileLabel.textContent = label;
@@ -234,20 +316,42 @@ function resetRunView(label) {
   el.mosaic.replaceChildren();
   state.mosaicFor = 0;
   el.cancel.disabled = false;
-  el.cancel.textContent = 'Cancel conversion';
-  paintUpload(0);
+  el.cancel.textContent = 'Cancel';
+  paintUpload(0, state.file ? state.file.size : 0);
 }
 
-function paintUpload(fraction) {
-  const pct = Math.round(fraction * 100);
-  el.stageLabel.textContent = 'Uploading PDF';
-  el.percent.innerHTML = `${pct}<i>%</i>`;
+function statLabels(a, b, c, d, e) {
+  el.dtPages.textContent = a;
+  el.dtRate.textContent = b;
+  el.dtElapsed.textContent = c;
+  el.dtEta.textContent = d;
+  el.dtSize.textContent = e;
+}
+
+function paintUpload(loaded, total) {
+  const pct = total ? (loaded / total) * 100 : 0;
+  const elapsed = (Date.now() - state.uploadStart) / 1000;
+  const rate = elapsed > 0.4 ? loaded / elapsed : 0;      // bytes per second
+  const left = rate > 0 ? (total - loaded) / rate : 0;
+
+  el.stageLabel.textContent = 'Uploading to the server';
+  el.percent.innerHTML = `${Math.round(pct)}<i>%</i>`;
   el.barFill.style.width = `${pct}%`;
-  el.statPages.textContent = '—/—';
-  el.statRate.textContent = '—';
+
+  statLabels('Sent', 'Speed', 'Elapsed', 'Left', 'Total');
+  el.statPages.textContent = humanBytes(loaded);
+  el.statRate.textContent = rate ? `${humanBytes(rate)}/s` : '—';
+  el.statElapsed.textContent = humanTime(elapsed);
+  el.statEta.textContent = rate ? humanTime(left) : '—';
+  el.statSize.textContent = humanBytes(total);
+}
+
+/* Upload bytes are all out; the server is still reading and saving them. */
+function paintHandoff() {
+  el.stageLabel.textContent = 'Upload complete — server is receiving';
+  el.percent.innerHTML = `100<i>%</i>`;
+  el.barFill.style.width = '100%';
   el.statEta.textContent = '—';
-  el.statElapsed.textContent = '0s';
-  el.statSize.textContent = humanBytes(state.file ? state.file.size * fraction : 0);
 }
 
 /* ── watching a job ───────────────────────────────────────────────────── */
@@ -299,6 +403,7 @@ function paintMosaic(done) {
 function paint(s) {
   if (s.total_pages) buildMosaic(s.total_pages);
 
+  statLabels('Pages', 'Rate', 'Elapsed', 'Left', 'Written');
   el.stageLabel.textContent = s.stage_label;
   el.percent.innerHTML = `${Math.round(s.percent)}<i>%</i>`;
   el.barFill.style.width = `${s.percent}%`;
@@ -349,6 +454,11 @@ function showFailure(message) {
 el.cancel.addEventListener('click', async () => {
   el.cancel.disabled = true;
   el.cancel.textContent = 'Cancelling…';
+  if (state.uploading && state.xhr) {
+    state.aborting = 'user';
+    state.xhr.abort();
+    return;
+  }
   if (state.jobId) {
     try { await api(`/api/cancel/${state.jobId}`, { method: 'POST' }); } catch (_) { /* ignore */ }
   }
@@ -356,6 +466,8 @@ el.cancel.addEventListener('click', async () => {
 
 function backToIdle() {
   stopWatching();
+  finishUpload();
+  el.retryUpload.hidden = true;
   state.jobId = null;
   clearFile();
   liveView('idle');
@@ -364,6 +476,13 @@ function backToIdle() {
 
 el.again.addEventListener('click', backToIdle);
 el.retry.addEventListener('click', backToIdle);
+
+// Leaving mid-upload would silently drop the transfer; warn first.
+window.addEventListener('beforeunload', (event) => {
+  if (!state.uploading) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
 
 el.dropServer.addEventListener('click', async () => {
   const id = el.dropServer.dataset.job;
@@ -391,6 +510,11 @@ async function refreshLibrary() {
 
   el.panelLibrary.hidden = jobs.length === 0;
   el.library.replaceChildren(...jobs.map(renderLibraryRow));
+
+  // While a file is going up there is no server-side job yet. Without this
+  // guard the poll below would decide nothing is running and reset the view
+  // to idle mid-upload, which looks exactly like the upload vanishing.
+  if (state.uploading) return;
 
   // Reconnect to a conversion that is still running (e.g. after a reload).
   if (!state.attached) {

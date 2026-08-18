@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, Up
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 
 from . import auth, config
 from .converter import normalise_options
@@ -168,11 +169,19 @@ async def upload(
     except HTTPException:
         shutil.rmtree(job.dir, ignore_errors=True)
         raise
+    except ClientDisconnect:
+        # Browser closed, tunnel dropped, user hit cancel - nothing to report
+        # back to, just make sure the half-written upload is not left behind.
+        shutil.rmtree(job.dir, ignore_errors=True)
+        log.info("upload aborted by client after %.1f MB (%s)", written / 1024 / 1024, filename)
+        raise HTTPException(status_code=499, detail="Upload aborted.") from None
     except Exception as exc:  # noqa: BLE001
         shutil.rmtree(job.dir, ignore_errors=True)
+        log.exception("upload of %s failed", filename)
         raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
     finally:
-        await file.close()
+        with contextlib.suppress(Exception):
+            await file.close()
 
     if written == 0:
         shutil.rmtree(job.dir, ignore_errors=True)
@@ -269,6 +278,24 @@ async def download(job_id: str) -> FileResponse:
 @app.get("/healthz")
 async def healthz() -> dict:
     return {"status": "ok"}
+
+
+@app.middleware("http")
+async def reject_oversized_uploads(request: Request, call_next):
+    """Turn away a too-large body before it is buffered to disk.
+
+    Without this the whole file is spooled first and only then measured, so a
+    2 GB mistake costs 2 GB of writes before the 413 comes back.
+    """
+    if request.method == "POST" and request.url.path == "/api/upload":
+        declared = request.headers.get("content-length")
+        # A little slack for the multipart envelope around the file itself.
+        if declared and declared.isdigit() and int(declared) > config.MAX_UPLOAD_BYTES + (1 << 20):
+            return JSONResponse(
+                {"detail": f"File is larger than the {config.MAX_UPLOAD_MB} MB limit."},
+                status_code=413,
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")

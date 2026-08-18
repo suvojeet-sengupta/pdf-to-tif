@@ -163,11 +163,11 @@
         <div class="mosaic" id="mosaic" hidden aria-hidden="true"></div>
 
         <dl class="stats">
-          <div><dt>Pages</dt><dd id="statPages">0/0</dd></div>
-          <div><dt>Rate</dt><dd id="statRate">—</dd></div>
-          <div><dt>Elapsed</dt><dd id="statElapsed">0s</dd></div>
-          <div><dt>Left</dt><dd id="statEta">—</dd></div>
-          <div><dt>Written</dt><dd id="statSize">0 B</dd></div>
+          <div><dt id="dtPages">Pages</dt><dd id="statPages">0/0</dd></div>
+          <div><dt id="dtRate">Rate</dt><dd id="statRate">—</dd></div>
+          <div><dt id="dtElapsed">Elapsed</dt><dd id="statElapsed">0s</dd></div>
+          <div><dt id="dtEta">Left</dt><dd id="statEta">—</dd></div>
+          <div><dt id="dtSize">Written</dt><dd id="statSize">0 B</dd></div>
         </dl>
 
         <details class="console">
@@ -175,7 +175,7 @@
           <pre id="log"></pre>
         </details>
 
-        <button id="cancel" class="btn btn--quiet btn--full">Cancel conversion</button>
+        <button id="cancel" class="btn btn--quiet btn--full">Cancel</button>
       </div>
 
       <div id="liveDone" hidden>
@@ -202,7 +202,10 @@
             <small id="failMessage"></small>
           </div>
         </div>
-        <button id="retry" class="btn btn--quiet btn--full">Start over</button>
+        <div class="row">
+          <button id="retryUpload" class="btn btn--solid" hidden>Try again</button>
+          <button id="retry" class="btn btn--quiet">Start over</button>
+        </div>
       </div>
     </section>
 

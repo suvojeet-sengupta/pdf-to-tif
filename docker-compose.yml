@@ -17,7 +17,8 @@ services:
     volumes:
       - pdf2tif-data:/data
     tmpfs:
-      - /tmp
+      # Small on purpose - uploads are spooled onto the data volume instead.
+      - /tmp:size=64m
     # Rendering large pages is memory hungry; cap it so one PDF cannot
     # take the whole VPS down. Raise if you convert huge documents.
     deploy:

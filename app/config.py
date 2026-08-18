@@ -1,6 +1,7 @@
 """Runtime configuration, all overridable through environment variables."""
 import os
 import secrets
+import tempfile
 from pathlib import Path
 
 
@@ -43,6 +44,14 @@ MIN_DPI = 72
 MAX_DPI = _int("MAX_DPI", 600)
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Incoming multipart bodies are spooled to a temporary file before the handler
+# sees them. Keep that on the data volume: /tmp is a small tmpfs in the
+# container, and a few hundred MB there would exhaust it or eat into RAM.
+UPLOAD_TMP = DATA_DIR / "tmp"
+UPLOAD_TMP.mkdir(parents=True, exist_ok=True)
+tempfile.tempdir = str(UPLOAD_TMP)
+os.environ.setdefault("TMPDIR", str(UPLOAD_TMP))
 
 # ---------------------------------------------------------------------------
 # Access control
