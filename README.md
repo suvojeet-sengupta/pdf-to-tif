@@ -43,16 +43,20 @@ git clone https://github.com/suvojeet-sengupta/pdf-to-tif.git
 cd pdf-to-tif
 
 cp .env.example .env
-# Set a real password, and a secret so sessions survive restarts:
-sed -i "s/^APP_PASSWORD=.*/APP_PASSWORD=$(openssl rand -base64 18)/" .env
-sed -i "s/^SESSION_SECRET=.*/SESSION_SECRET=$(openssl rand -hex 32)/" .env
-grep APP_PASSWORD .env          # note it down - this is your login
+nano .env                       # set APP_PASSWORD to whatever you want to log in with
+
+# SESSION_SECRET keeps you logged in across restarts - generate one:
+python3 -c 'import secrets; print(secrets.token_hex(32))'
+# ...and paste it into SESSION_SECRET= in .env
 
 docker compose up -d --build
 ```
 
 > The app refuses to start without `APP_PASSWORD`. If the instance is already
 > protected by Cloudflare Access or a VPN, set `ALLOW_NO_PASSWORD=true` instead.
+>
+> `.env` is git-ignored on purpose — it holds your password, so it is never
+> committed. Create it fresh on every machine you deploy to.
 
 Then open <http://localhost:9000>.
 
@@ -78,7 +82,7 @@ docker compose down -v       # stop and wipe stored archives
 docker build -t pdf-to-tif .
 docker run -d --name pdf-to-tif --restart unless-stopped \
   -e APP_PASSWORD='your-password' \
-  -e SESSION_SECRET="$(openssl rand -hex 32)" \
+  -e SESSION_SECRET="$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
   -p 127.0.0.1:9000:9000 -v pdf2tif-data:/data pdf-to-tif
 ```
 

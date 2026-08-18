@@ -8,3 +8,8 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# Never commit real secrets - .env holds APP_PASSWORD and SESSION_SECRET.
+.env
+.env.*
+!.env.example
