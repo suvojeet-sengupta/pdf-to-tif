@@ -2,131 +2,227 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PDF → TIFF Converter</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#12100e">
+<meta name="color-scheme" content="dark light">
+<title>Pagesmith · PDF to TIFF</title>
 <link rel="stylesheet" href="/style.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗂️</text></svg>">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23e8863a'/><path d='M9 8h9l5 5v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z' fill='%2318140f'/><path d='M11 17h10M11 21h7' stroke='%23e8863a' stroke-width='2' stroke-linecap='round'/></svg>">
 </head>
 <body>
-<main class="shell">
 
-  <header class="head">
-    <h1>PDF <span class="arrow">→</span> TIFF</h1>
-    <p>Every page becomes its own TIFF file, delivered as one ZIP.</p>
+<!-- ══ sign in ══════════════════════════════════════════════════════════ -->
+<div id="gate" class="gate" hidden>
+  <form id="gateForm" class="gate__panel" autocomplete="on">
+    <div class="mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32"><path d="M9 5h10l6 6v16a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/><path d="M19 5v6h6"/><path d="M12 18h8M12 22h5"/></svg>
+    </div>
+    <h1 class="gate__title">Pagesmith</h1>
+    <p class="gate__sub">Private PDF → TIFF workshop</p>
+
+    <label class="field">
+      <span class="field__label">Access password</span>
+      <input type="password" id="password" name="password" autocomplete="current-password"
+             required placeholder="••••••••••" spellcheck="false">
+    </label>
+
+    <button type="submit" class="btn btn--solid btn--full" id="gateSubmit">Unlock</button>
+    <p id="gateError" class="msg msg--bad" hidden></p>
+  </form>
+</div>
+
+<!-- ══ workspace ════════════════════════════════════════════════════════ -->
+<div id="workspace" class="wrap" hidden>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand__mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><path d="M9 5h10l6 6v16a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/><path d="M19 5v6h6"/><path d="M12 18h8M12 22h5"/></svg>
+      </span>
+      <span class="brand__text">
+        <b>Pagesmith</b>
+        <small>pdf → one tiff per page</small>
+      </span>
+    </div>
+    <div class="topbar__right">
+      <span class="tag" id="tagWorkers" title="Parallel render workers">—</span>
+      <button type="button" class="btn btn--quiet" id="logout" hidden>Sign out</button>
+    </div>
   </header>
 
-  <!-- ── step 1: pick a file ─────────────────────────────────────────── -->
-  <section id="pick" class="card">
-    <label id="drop" class="drop" for="file">
-      <input type="file" id="file" accept="application/pdf,.pdf" hidden>
-      <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-        <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" stroke-linecap="round" stroke-linejoin="round"/>
-        <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke-linecap="round"/>
-      </svg>
-      <strong class="drop-title">Drop a PDF here</strong>
-      <span class="drop-sub">or click to browse &middot; max <b id="maxSize">—</b> MB</span>
-    </label>
+  <main class="board">
 
-    <div id="chosen" class="chosen" hidden>
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="file-icon">
-        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>
-        <path d="M14 3v5h5"/>
-      </svg>
-      <div class="chosen-meta">
-        <span id="chosenName">—</span>
-        <small id="chosenSize"></small>
+    <!-- ── source + settings ──────────────────────────────────────────── -->
+    <section class="panel" id="panelSource">
+      <div class="panel__head">
+        <span class="step">01</span>
+        <h2>Source</h2>
       </div>
-      <button type="button" id="clearFile" class="ghost" title="Remove file">✕</button>
-    </div>
 
-    <div class="options">
-      <div class="opt">
-        <label for="dpi">Resolution</label>
-        <select id="dpi">
-          <option value="100">100 DPI &middot; draft</option>
-          <option value="150">150 DPI</option>
-          <option value="200" selected>200 DPI &middot; recommended</option>
-          <option value="300">300 DPI &middot; print</option>
-          <option value="400">400 DPI</option>
-          <option value="600">600 DPI &middot; archival</option>
-        </select>
+      <label id="drop" class="drop" for="file" tabindex="0">
+        <input type="file" id="file" accept="application/pdf,.pdf" hidden>
+        <span class="drop__glyph" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 15V4m0 0 4 4m-4-4L8 8"/><path d="M4 14v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg>
+        </span>
+        <b>Drop a PDF</b>
+        <small>or tap to browse · up to <span id="maxSize">—</span> MB</small>
+      </label>
+
+      <div id="chosen" class="chosen" hidden>
+        <span class="chosen__ext">PDF</span>
+        <span class="chosen__meta">
+          <b id="chosenName">—</b>
+          <small id="chosenSize"></small>
+        </span>
+        <button type="button" class="btn btn--icon" id="clearFile" aria-label="Remove file">✕</button>
       </div>
-      <div class="opt">
-        <label for="color">Colour</label>
-        <select id="color">
-          <option value="color" selected>Full colour</option>
-          <option value="gray">Grayscale</option>
-          <option value="bw">Black &amp; white (G4)</option>
-        </select>
+
+      <div class="panel__head panel__head--sub">
+        <span class="step">02</span>
+        <h2>Output</h2>
       </div>
-      <div class="opt">
-        <label for="compression">TIFF compression</label>
-        <select id="compression">
-          <option value="lzw" selected>LZW &middot; fast, lossless</option>
-          <option value="packbits">PackBits &middot; fastest</option>
-          <option value="none">None &middot; raw, largest</option>
-          <option value="deflate">Deflate &middot; smallest</option>
-        </select>
+
+      <div class="fields">
+        <label class="field">
+          <span class="field__label">Resolution</span>
+          <select id="dpi">
+            <option value="100">100 dpi · draft</option>
+            <option value="150">150 dpi</option>
+            <option value="200" selected>200 dpi · balanced</option>
+            <option value="300">300 dpi · print</option>
+            <option value="400">400 dpi</option>
+            <option value="600">600 dpi · archival</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field__label">Colour</span>
+          <select id="color">
+            <option value="color" selected>Full colour</option>
+            <option value="gray">Grayscale</option>
+            <option value="bw">Bilevel · G4</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field__label">TIFF codec</span>
+          <select id="compression">
+            <option value="lzw" selected>LZW · fast</option>
+            <option value="packbits">PackBits · fastest</option>
+            <option value="none">None · raw</option>
+            <option value="deflate">Deflate · smallest</option>
+          </select>
+        </label>
       </div>
-    </div>
 
-    <label class="check">
-      <input type="checkbox" id="zipCompress">
-      <span>Also compress the ZIP <small>(slower — off by default, TIFFs are already compressed)</small></span>
-    </label>
-
-    <button id="start" class="primary" disabled>Convert to TIFF</button>
-    <p id="pickError" class="error" hidden></p>
-  </section>
-
-  <!-- ── step 2: live progress ───────────────────────────────────────── -->
-  <section id="progress" class="card" hidden>
-    <div class="stage-row">
-      <span id="spinner" class="spinner"></span>
-      <div>
-        <strong id="stageLabel">Uploading</strong>
-        <small id="fileLabel"></small>
+      <div class="toggles">
+        <label class="toggle">
+          <input type="checkbox" id="autoDelete">
+          <span class="toggle__box" aria-hidden="true"></span>
+          <span class="toggle__text">Delete from server after download
+            <small>The archive is wiped the moment you finish downloading it.</small></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="zipCompress">
+          <span class="toggle__box" aria-hidden="true"></span>
+          <span class="toggle__text">Compress the ZIP as well
+            <small>Slower. TIFFs are already compressed, so gains are small.</small></span>
+        </label>
       </div>
-      <span id="percent" class="percent">0%</span>
-    </div>
 
-    <div class="bar"><div id="barFill" class="bar-fill"></div></div>
+      <button id="start" class="btn btn--solid btn--full" disabled>Convert</button>
+      <p id="pickError" class="msg msg--bad" hidden></p>
+    </section>
 
-    <dl class="stats">
-      <div><dt>Pages</dt><dd id="statPages">0 / 0</dd></div>
-      <div><dt>Speed</dt><dd id="statRate">—</dd></div>
-      <div><dt>Elapsed</dt><dd id="statElapsed">0s</dd></div>
-      <div><dt>Remaining</dt><dd id="statEta">—</dd></div>
-      <div><dt>Output</dt><dd id="statSize">0 B</dd></div>
-    </dl>
+    <!-- ── live console ───────────────────────────────────────────────── -->
+    <section class="panel panel--live" id="panelLive">
+      <div class="panel__head">
+        <span class="step">03</span>
+        <h2>Progress</h2>
+        <span class="dot" id="liveDot" data-state="idle"></span>
+      </div>
 
-    <details class="logbox" open>
-      <summary>Activity log</summary>
-      <pre id="log"></pre>
-    </details>
+      <div id="liveIdle" class="idle">
+        <div class="idle__art" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span>
+        </div>
+        <p>Nothing running. Pick a PDF to start.</p>
+        <small>A conversion keeps going even if you close this tab — reopen it and you land right back here.</small>
+      </div>
 
-    <button id="cancel" class="ghost wide">Cancel</button>
-  </section>
+      <div id="liveRun" hidden>
+        <div class="readout">
+          <span class="readout__pct" id="percent">0<i>%</i></span>
+          <span class="readout__side">
+            <b id="stageLabel">Uploading</b>
+            <small id="fileLabel">—</small>
+          </span>
+        </div>
 
-  <!-- ── step 3: result ──────────────────────────────────────────────── -->
-  <section id="result" class="card" hidden>
-    <div class="done-mark">✓</div>
-    <h2 id="resultTitle">Conversion complete</h2>
-    <p id="resultSummary" class="muted"></p>
-    <a id="download" class="primary as-link" href="#" download>Download ZIP</a>
-    <button id="again" class="ghost wide">Convert another PDF</button>
-    <p class="muted tiny">The archive is deleted from the server after <b id="ttl">—</b> minutes.</p>
-  </section>
+        <div class="rail"><div class="rail__fill" id="barFill"></div></div>
 
-  <section id="failure" class="card" hidden>
-    <div class="fail-mark">!</div>
-    <h2>Conversion failed</h2>
-    <p id="failMessage" class="error"></p>
-    <button id="retry" class="ghost wide">Start over</button>
-  </section>
+        <div class="mosaic" id="mosaic" hidden aria-hidden="true"></div>
 
-  <footer class="foot">Runs entirely on your own server &middot; nothing is sent anywhere else.</footer>
-</main>
+        <dl class="stats">
+          <div><dt>Pages</dt><dd id="statPages">0/0</dd></div>
+          <div><dt>Rate</dt><dd id="statRate">—</dd></div>
+          <div><dt>Elapsed</dt><dd id="statElapsed">0s</dd></div>
+          <div><dt>Left</dt><dd id="statEta">—</dd></div>
+          <div><dt>Written</dt><dd id="statSize">0 B</dd></div>
+        </dl>
+
+        <details class="console">
+          <summary>Activity log</summary>
+          <pre id="log"></pre>
+        </details>
+
+        <button id="cancel" class="btn btn--quiet btn--full">Cancel conversion</button>
+      </div>
+
+      <div id="liveDone" hidden>
+        <div class="verdict verdict--ok">
+          <span class="verdict__badge">✓</span>
+          <div>
+            <b id="resultTitle">Done</b>
+            <small id="resultSummary"></small>
+          </div>
+        </div>
+        <a id="download" class="btn btn--solid btn--full" href="#" download>Download ZIP</a>
+        <p id="autoNote" class="msg msg--note" hidden>This archive deletes itself once the download finishes.</p>
+        <div class="row">
+          <button id="again" class="btn btn--quiet">Convert another</button>
+          <button id="dropServer" class="btn btn--quiet btn--danger">Delete from server</button>
+        </div>
+      </div>
+
+      <div id="liveFail" hidden>
+        <div class="verdict verdict--bad">
+          <span class="verdict__badge">!</span>
+          <div>
+            <b>Conversion failed</b>
+            <small id="failMessage"></small>
+          </div>
+        </div>
+        <button id="retry" class="btn btn--quiet btn--full">Start over</button>
+      </div>
+    </section>
+
+    <!-- ── library ────────────────────────────────────────────────────── -->
+    <section class="panel panel--library" id="panelLibrary" hidden>
+      <div class="panel__head">
+        <span class="step">04</span>
+        <h2>On this server</h2>
+        <button type="button" class="btn btn--icon" id="refreshJobs" title="Refresh">⟳</button>
+      </div>
+      <ul class="library" id="library"></ul>
+    </section>
+
+  </main>
+
+  <footer class="foot">
+    Runs entirely on your own machine · archives expire after <span id="ttl">—</span> min
+  </footer>
+</div>
+
 <script src="/app.js"></script>
 </body>
 </html>

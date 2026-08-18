@@ -1,4 +1,4 @@
-"""FastAPI application: upload a PDF, watch it convert, download the ZIP."""
+"""FastAPI application: sign in, convert a PDF, watch it live, download the ZIP."""
 from __future__ import annotations
 
 import asyncio
@@ -8,11 +8,12 @@ import logging
 import shutil
 from pathlib import Path
 
-from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
-from . import config
+from . import auth, config
 from .converter import normalise_options
 from .jobs import manager
 
@@ -31,10 +32,25 @@ SSE_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
+Guarded = Depends(auth.require_session)
+
 
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
+    if not config.AUTH_ENABLED and not config.ALLOW_NO_PASSWORD:
+        raise RuntimeError(
+            "APP_PASSWORD is not set. Set it in your environment (see .env.example), "
+            "or set ALLOW_NO_PASSWORD=true if the app is already protected by "
+            "Cloudflare Access or a VPN."
+        )
+    if not config.AUTH_ENABLED:
+        log.warning("running without a password - ALLOW_NO_PASSWORD is enabled")
+
     manager.start()
+    restored = manager.restore()
+    if restored:
+        log.info("restored %d finished archive(s) from disk", restored)
+
     cleaner = asyncio.create_task(_cleanup_loop())
     try:
         yield
@@ -56,12 +72,19 @@ async def _cleanup_loop() -> None:
         await asyncio.sleep(config.CLEANUP_INTERVAL_SECONDS)
 
 
-app = FastAPI(title="PDF to TIFF", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title=config.APP_NAME, docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
+# ---------------------------------------------------------------------------
+# session
+# ---------------------------------------------------------------------------
 @app.get("/api/config")
-async def api_config() -> dict:
+async def api_config(request: Request) -> dict:
+    """Public: the login screen needs this before a session exists."""
     return {
+        "app_name": config.APP_NAME,
+        "auth_enabled": config.AUTH_ENABLED,
+        "authenticated": auth.is_authenticated(request),
         "max_upload_mb": config.MAX_UPLOAD_MB,
         "max_pages": config.MAX_PAGES,
         "default_dpi": config.DEFAULT_DPI,
@@ -72,18 +95,47 @@ async def api_config() -> dict:
     }
 
 
-@app.get("/healthz")
-async def healthz() -> dict:
-    return {"status": "ok"}
+@app.post("/api/login")
+async def login(response: Response, request: Request, password: str = Form("")) -> dict:
+    if not config.AUTH_ENABLED:
+        return {"authenticated": True}
+
+    client = auth.client_key(request)
+    locked = auth.limiter.locked_for(client)
+    if locked:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many attempts. Try again in {locked // 60 + 1} minute(s).",
+        )
+
+    if not auth.password_matches(password):
+        auth.limiter.record_failure(client)
+        log.warning("failed login from %s", client)
+        raise HTTPException(status_code=401, detail="Wrong password.")
+
+    auth.limiter.clear(client)
+    response.set_cookie(value=auth.issue_token(), **auth.cookie_kwargs())
+    log.info("login from %s", client)
+    return {"authenticated": True}
 
 
-@app.post("/api/upload")
+@app.post("/api/logout")
+async def logout(response: Response) -> dict:
+    response.delete_cookie(config.SESSION_COOKIE, path="/")
+    return {"authenticated": False}
+
+
+# ---------------------------------------------------------------------------
+# jobs
+# ---------------------------------------------------------------------------
+@app.post("/api/upload", dependencies=[Guarded])
 async def upload(
     file: UploadFile,
     dpi: int = Form(config.DEFAULT_DPI),
     color_mode: str = Form("color"),
     compression: str = Form("lzw"),
     zip_compress: str = Form("false"),
+    auto_delete: str = Form("false"),
 ) -> JSONResponse:
     filename = (file.filename or "document.pdf").strip()
     if not filename.lower().endswith(".pdf"):
@@ -98,7 +150,8 @@ async def upload(
         dpi=dpi,
         color_mode=color_mode,
         compression=compression,
-        zip_compress=str(zip_compress).lower() in ("1", "true", "yes", "on"),
+        zip_compress=_truthy(zip_compress),
+        auto_delete=_truthy(auto_delete),
     )
 
     written = 0
@@ -130,7 +183,14 @@ async def upload(
     return JSONResponse({"job_id": job.id, "status_url": f"/api/events/{job.id}"})
 
 
-@app.get("/api/status/{job_id}")
+@app.get("/api/jobs", dependencies=[Guarded])
+async def list_jobs() -> dict:
+    """Everything this server still knows about - lets any browser pick up
+    a conversion that is already running, or re-download a finished one."""
+    return {"jobs": manager.list_jobs()}
+
+
+@app.get("/api/status/{job_id}", dependencies=[Guarded])
 async def status(job_id: str) -> dict:
     job = manager.get(job_id)
     if job is None:
@@ -138,14 +198,21 @@ async def status(job_id: str) -> dict:
     return job.snapshot()
 
 
-@app.post("/api/cancel/{job_id}")
+@app.post("/api/cancel/{job_id}", dependencies=[Guarded])
 async def cancel(job_id: str) -> dict:
     if not manager.cancel(job_id):
         raise HTTPException(status_code=404, detail="Job is not running.")
     return {"cancelled": True}
 
 
-@app.get("/api/events/{job_id}")
+@app.delete("/api/jobs/{job_id}", dependencies=[Guarded])
+async def delete_job(job_id: str) -> dict:
+    if not manager.delete(job_id):
+        raise HTTPException(status_code=404, detail="Unknown or expired job.")
+    return {"deleted": True}
+
+
+@app.get("/api/events/{job_id}", dependencies=[Guarded])
 async def events(job_id: str, request: Request) -> StreamingResponse:
     job = manager.get(job_id)
     if job is None:
@@ -174,7 +241,7 @@ async def events(job_id: str, request: Request) -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
-@app.get("/api/download/{job_id}")
+@app.get("/api/download/{job_id}", dependencies=[Guarded])
 async def download(job_id: str) -> FileResponse:
     job = manager.get(job_id)
     if job is None:
@@ -186,12 +253,26 @@ async def download(job_id: str) -> FileResponse:
     if not zip_path.is_file():
         raise HTTPException(status_code=410, detail="The archive has already expired.")
 
+    manager.touch_download(job)
+    # "Delete after download" runs once the response has been fully sent.
+    cleanup = BackgroundTask(manager.delete, job.id) if job.auto_delete else None
+
     return FileResponse(
         zip_path,
         media_type="application/zip",
         filename=job.zip_name,
         headers={"Cache-Control": "no-store"},
+        background=cleanup,
     )
+
+
+@app.get("/healthz")
+async def healthz() -> dict:
+    return {"status": "ok"}
+
+
+def _truthy(value: str) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

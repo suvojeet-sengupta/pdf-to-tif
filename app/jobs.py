@@ -1,6 +1,7 @@
 """Job store and the render -> zip pipeline."""
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import threading
@@ -47,6 +48,7 @@ class Job:
     dir: Path
     pdf_path: Path
 
+    auto_delete: bool = False
     stage: str = "queued"
     total_pages: int = 0
     done_pages: int = 0
@@ -58,6 +60,7 @@ class Job:
     started_at: float = 0.0
     finished_at: float = 0.0
     cancel_requested: bool = False
+    downloads: int = 0
     log_lines: list[str] = field(default_factory=list)
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -128,6 +131,18 @@ class Job:
                 "compression": self.compression,
                 "log": list(self.log_lines[-40:]),
                 "download_url": f"/api/download/{self.id}" if self.stage == "done" else "",
+                "auto_delete": self.auto_delete,
+                "downloads": self.downloads,
+                "created_at": self.created_at,
+                "expires_in": max(
+                    0,
+                    int(
+                        (self.finished_at or self.created_at)
+                        + config.JOB_TTL_MINUTES * 60
+                        - time.time()
+                    ),
+                ),
+                "active": self.stage in ("queued", "analyzing", "rendering", "packaging"),
                 "version": self._version,
             }
 
@@ -174,6 +189,7 @@ class JobManager:
         color_mode: str,
         compression: str,
         zip_compress: bool,
+        auto_delete: bool = False,
     ) -> Job:
         job_id = uuid.uuid4().hex[:16]
         job_dir = config.JOBS_DIR / job_id
@@ -185,6 +201,7 @@ class JobManager:
             color_mode=color_mode,
             compression=compression,
             zip_compress=zip_compress,
+            auto_delete=auto_delete,
             dir=job_dir,
             pdf_path=job_dir / "source.pdf",
         )
@@ -239,6 +256,7 @@ class JobManager:
                 finished_at=time.time(),
             )
             job.note(f"Ready: {zip_path.name} ({_human(zip_path.stat().st_size)})")
+            self._write_meta(job)
             # The rendered pages live inside the archive now.
             shutil.rmtree(job.dir / "tif", ignore_errors=True)
             job.pdf_path.unlink(missing_ok=True)
@@ -306,6 +324,85 @@ class JobManager:
 
     def _discard_workdir(self, job: Job) -> None:
         shutil.rmtree(job.dir, ignore_errors=True)
+
+    # -- persistence -------------------------------------------------------
+    META_FIELDS = (
+        "id", "original_name", "dpi", "color_mode", "compression", "zip_compress",
+        "auto_delete", "stage", "total_pages", "done_pages", "bytes_written",
+        "zip_name", "zip_size", "created_at", "started_at", "finished_at",
+        "downloads",
+    )
+
+    def _write_meta(self, job: Job) -> None:
+        try:
+            data = {name: getattr(job, name) for name in self.META_FIELDS}
+            (job.dir / "meta.json").write_text(json.dumps(data))
+        except OSError:
+            log.warning("could not persist metadata for job %s", job.id)
+
+    def touch_download(self, job: Job) -> None:
+        job.update(downloads=job.downloads + 1)
+        self._write_meta(job)
+
+    def restore(self) -> int:
+        """Re-attach finished archives left on disk by a previous run."""
+        if not config.JOBS_DIR.exists():
+            return 0
+        restored = 0
+        for path in sorted(config.JOBS_DIR.iterdir()):
+            meta_file = path / "meta.json"
+            if not path.is_dir() or not meta_file.is_file():
+                continue
+            try:
+                data = json.loads(meta_file.read_text())
+            except (OSError, ValueError):
+                continue
+            zip_name = data.get("zip_name", "")
+            if data.get("stage") != "done" or not (path / zip_name).is_file():
+                shutil.rmtree(path, ignore_errors=True)
+                continue
+            job = Job(
+                id=data["id"],
+                original_name=data.get("original_name", "document.pdf"),
+                dpi=data.get("dpi", config.DEFAULT_DPI),
+                color_mode=data.get("color_mode", "color"),
+                compression=data.get("compression", "lzw"),
+                zip_compress=data.get("zip_compress", False),
+                auto_delete=data.get("auto_delete", False),
+                dir=path,
+                pdf_path=path / "source.pdf",
+            )
+            for name in (
+                "stage", "total_pages", "done_pages", "bytes_written", "zip_name",
+                "zip_size", "created_at", "started_at", "finished_at", "downloads",
+            ):
+                if name in data:
+                    setattr(job, name, data[name])
+            job.log_lines.append("Restored after a server restart")
+            with self._lock:
+                self._jobs[job.id] = job
+            restored += 1
+        return restored
+
+    # -- listing / removal -------------------------------------------------
+    def list_jobs(self) -> list[dict]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        jobs.sort(key=lambda j: j.created_at, reverse=True)
+        return [job.snapshot() for job in jobs[: config.LIBRARY_LIMIT]]
+
+    def delete(self, job_id: str) -> bool:
+        job = self.get(job_id)
+        if job is None:
+            return False
+        if not job.terminal:
+            job.update(cancel_requested=True)
+            job.note("Removed while running")
+        with self._lock:
+            self._jobs.pop(job_id, None)
+        shutil.rmtree(job.dir, ignore_errors=True)
+        log.info("job %s deleted", job_id)
+        return True
 
     # -- housekeeping ------------------------------------------------------
     def cleanup(self) -> int:

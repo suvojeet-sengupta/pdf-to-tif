@@ -5,7 +5,11 @@ import io
 import os
 from dataclasses import dataclass
 
-import fitz  # PyMuPDF
+try:  # PyMuPDF >= 1.26 renamed the top-level module; `fitz` still works but warns.
+    import pymupdf as fitz
+except ImportError:  # pragma: no cover - older PyMuPDF releases
+    import fitz
+
 from PIL import Image
 
 # Colour modes offered in the UI.

@@ -1,4 +1,4 @@
-# PDF → TIFF
+# Pagesmith — PDF → TIFF
 
 A small self-hosted web app: upload a PDF, every page is rendered to its own TIFF,
 and the whole set comes back as a single ZIP. Progress is streamed live to the
@@ -9,18 +9,28 @@ Built for speed: pages render in parallel across a pool of worker processes, TIF
 use fast lossless compression (LZW by default), and the ZIP is **stored, not
 deflated**, so packaging is effectively instant.
 
+The whole app sits behind a single shared password, and conversions live on the
+server rather than in the tab — close the browser mid-job, come back later, and
+you land straight back on the running progress view.
+
 ![port](https://img.shields.io/badge/port-9000-4f8cff) ![docker](https://img.shields.io/badge/docker-ready-2496ed)
 
 ---
 
 ## Features
 
+- **Password protected** — one shared password, signed session cookie, per-IP lockout after repeated failures
 - Drag-and-drop upload with real upload progress
-- One TIFF per PDF page, named `<document>_page_0001.tif`, `…_0002.tif`, …
-- Live conversion progress over Server-Sent Events (pages done, %, pages/sec, ETA, activity log)
-- ZIP built with no compression by default → fast, since TIFFs are already compressed
+- One TIFF per PDF page, named `<document>_page_001.tif`, `…_002.tif`, …
+- Live progress over Server-Sent Events: page mosaic, %, pages/sec, ETA, activity log
+- **Server-side jobs** — reload the page or open it on your phone and the running conversion is still there
+- **Library** of everything still on the server, with re-download and one-click delete
+- **Delete after download** — tick the box and the archive is wiped the moment the download finishes
+- ZIP stored rather than deflated → fast, since TIFFs are already compressed
 - Resolution 100–600 DPI, colour / grayscale / bilevel (CCITT G4)
-- Cancel a running job; finished archives auto-delete after a TTL
+- Cancel a running job; finished archives expire automatically
+- Finished archives survive a container restart
+- Responsive UI built for phone and desktop, light and dark
 - Runs as one container on port **9000**, ready for a Cloudflare Tunnel
 - No external services — everything happens on your own box
 
@@ -29,10 +39,20 @@ deflated**, so packaging is effectively instant.
 ## Quick start (Docker)
 
 ```bash
-git clone https://github.com/suvojeet321/pdf-to-tif.git
+git clone https://github.com/suvojeet-sengupta/pdf-to-tif.git
 cd pdf-to-tif
+
+cp .env.example .env
+# Set a real password, and a secret so sessions survive restarts:
+sed -i "s/^APP_PASSWORD=.*/APP_PASSWORD=$(openssl rand -base64 18)/" .env
+sed -i "s/^SESSION_SECRET=.*/SESSION_SECRET=$(openssl rand -hex 32)/" .env
+grep APP_PASSWORD .env          # note it down - this is your login
+
 docker compose up -d --build
 ```
+
+> The app refuses to start without `APP_PASSWORD`. If the instance is already
+> protected by Cloudflare Access or a VPN, set `ALLOW_NO_PASSWORD=true` instead.
 
 Then open <http://localhost:9000>.
 
@@ -57,6 +77,8 @@ docker compose down -v       # stop and wipe stored archives
 ```bash
 docker build -t pdf-to-tif .
 docker run -d --name pdf-to-tif --restart unless-stopped \
+  -e APP_PASSWORD='your-password' \
+  -e SESSION_SECRET="$(openssl rand -hex 32)" \
   -p 127.0.0.1:9000:9000 -v pdf2tif-data:/data pdf-to-tif
 ```
 
@@ -121,6 +143,15 @@ All settings are environment variables — set them in `docker-compose.yml`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `APP_PASSWORD` | — | **Required.** Shared password for the web UI |
+| `ALLOW_NO_PASSWORD` | `false` | Start with no password (only behind Access / VPN) |
+| `SESSION_SECRET` | random | Signs session cookies; set it so logins survive restarts |
+| `SESSION_TTL_HOURS` | `336` | How long a login stays valid |
+| `COOKIE_SECURE` | `true` | Set `false` only if you browse over plain `http://` |
+| `LOGIN_MAX_ATTEMPTS` | `8` | Failed logins before a lockout |
+| `LOGIN_LOCKOUT_SECONDS` | `300` | Lockout duration |
+| `APP_NAME` | `Pagesmith` | Name shown in the UI |
+| `LIBRARY_LIMIT` | `40` | Jobs listed in the library |
 | `PORT` | `9000` | HTTP port inside the container |
 | `RENDER_WORKERS` | `min(8, cores)` | Worker processes rendering pages in parallel |
 | `MAX_CONCURRENT_JOBS` | `2` | How many PDFs may convert at the same time |
@@ -143,9 +174,16 @@ All settings are environment variables — set them in `docker-compose.yml`.
 
 ## API
 
+Every endpoint below except `/api/config`, `/api/login` and `/healthz` requires
+the session cookie.
+
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/upload` | multipart: `file`, `dpi`, `color_mode`, `compression`, `zip_compress` → `{job_id}` |
+| `POST` | `/api/login` | form field `password` → sets the session cookie |
+| `POST` | `/api/logout` | clears the session cookie |
+| `POST` | `/api/upload` | multipart: `file`, `dpi`, `color_mode`, `compression`, `zip_compress`, `auto_delete` → `{job_id}` |
+| `GET` | `/api/jobs` | Everything the server still holds (running + finished) |
+| `DELETE` | `/api/jobs/{job_id}` | Delete a job and its archive from the server |
 | `GET` | `/api/events/{job_id}` | SSE stream of progress snapshots |
 | `GET` | `/api/status/{job_id}` | One-shot progress snapshot (polling fallback) |
 | `POST` | `/api/cancel/{job_id}` | Cancel a running job |
@@ -156,10 +194,13 @@ All settings are environment variables — set them in `docker-compose.yml`.
 Convert from the command line:
 
 ```bash
-JOB=$(curl -s -F file=@input.pdf -F dpi=200 -F color_mode=color \
+curl -s -c jar -F password='your-password' http://localhost:9000/api/login
+
+JOB=$(curl -s -b jar -F file=@input.pdf -F dpi=200 -F color_mode=color \
       http://localhost:9000/api/upload | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
-curl -N http://localhost:9000/api/events/$JOB        # watch progress
-curl -OJ http://localhost:9000/api/download/$JOB     # grab the archive
+curl -N  -b jar http://localhost:9000/api/events/$JOB        # watch progress
+curl -OJ -b jar http://localhost:9000/api/download/$JOB      # grab the archive
+curl -X DELETE -b jar http://localhost:9000/api/jobs/$JOB    # wipe it from the server
 ```
 
 ---
@@ -169,7 +210,8 @@ curl -OJ http://localhost:9000/api/download/$JOB     # grab the archive
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-DATA_DIR=./data uvicorn app.main:app --reload --port 9000
+DATA_DIR=./data APP_PASSWORD=dev COOKIE_SECURE=false \
+  uvicorn app.main:app --reload --port 9000
 ```
 
 ## How it works
@@ -184,10 +226,14 @@ upload  ──▶  PyMuPDF opens the PDF, page count is read
              └─▶ zipfile (ZIP_STORED) packs the TIFFs
                    │
                    └─▶ download link, deleted after JOB_TTL_MINUTES
+                       or immediately, if "delete after download" is on
 ```
 
 Job state lives in memory, so the container runs a single uvicorn worker; the
-CPU-heavy work is what fans out across processes.
+CPU-heavy work is what fans out across processes. Finished jobs also write a
+small `meta.json` next to their archive, which is how the library is rebuilt
+after a restart. Browsers hold no job state at all — they ask `/api/jobs` on
+load, so any device with the password sees the same conversions.
 
 ## Licence
 
