@@ -264,6 +264,8 @@ body::before {
 .chosen__meta { display: grid; min-width: 0; flex: 1; }
 .chosen__meta b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .chosen__meta small { color: var(--text-dim); font: 500 12px var(--mono); }
+.chosen-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.chosen-list:empty { display: none; }
 
 /* ── form controls ────────────────────────────────────────────────────── */
 .fields { display: grid; gap: 11px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }

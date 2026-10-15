@@ -15,11 +15,12 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config
-from .converter import RenderSpec, inspect_pdf, render_page
+from .converter import RenderSpec, estimate_render_bytes, inspect_pdf, render_page
 
 log = logging.getLogger("pdf2tif.jobs")
 
@@ -36,6 +37,28 @@ STAGE_LABELS = {
 
 class JobCancelled(Exception):
     pass
+
+
+class MemoryBudget:
+    """Shared ceiling on the estimated memory of pages being rendered."""
+
+    def __init__(self, total: int) -> None:
+        self.total = max(1, total)
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self, amount: int) -> int:
+        # A page bigger than the whole budget still runs, just on its own.
+        amount = min(amount, self.total)
+        with self._lock:
+            if self._used + amount > self.total:
+                return 0
+            self._used += amount
+            return amount
+
+    def release(self, amount: int) -> None:
+        with self._lock:
+            self._used = max(0, self._used - amount)
 
 
 @dataclass
@@ -63,6 +86,7 @@ class Job:
     cancel_requested: bool = False
     downloads: int = 0
     log_lines: list[str] = field(default_factory=list)
+    page_sizes: list[tuple[float, float]] = field(default_factory=list, repr=False)
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _version: int = 0
@@ -153,6 +177,8 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._pool: ProcessPoolExecutor | None = None
+        self._pool_lock = threading.Lock()
+        self._budget = MemoryBudget(config.RENDER_MEMORY_BYTES)
         self._drivers = ThreadPoolExecutor(
             max_workers=config.MAX_CONCURRENT_JOBS, thread_name_prefix="job"
         )
@@ -160,17 +186,36 @@ class JobManager:
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
+        self._pool = self._new_pool()
+        log.info(
+            "render pool started with %d worker(s), %d concurrent job(s), %d MB render budget",
+            config.RENDER_WORKERS,
+            config.MAX_CONCURRENT_JOBS,
+            config.RENDER_MEMORY_BYTES // (1024 * 1024),
+        )
+
+    @staticmethod
+    def _new_pool() -> ProcessPoolExecutor:
         kwargs = {"max_workers": config.RENDER_WORKERS}
         try:
             # Recycle workers periodically so long batches cannot leak memory.
-            self._pool = ProcessPoolExecutor(max_tasks_per_child=250, **kwargs)
+            return ProcessPoolExecutor(max_tasks_per_child=250, **kwargs)
         except TypeError:  # pragma: no cover - Python < 3.11
-            self._pool = ProcessPoolExecutor(**kwargs)
-        log.info(
-            "render pool started with %d worker(s), %d concurrent job(s)",
-            config.RENDER_WORKERS,
-            config.MAX_CONCURRENT_JOBS,
-        )
+            return ProcessPoolExecutor(**kwargs)
+
+    def _current_pool(self) -> ProcessPoolExecutor:
+        with self._pool_lock:
+            assert self._pool is not None
+            return self._pool
+
+    def _replace_pool(self, broken: ProcessPoolExecutor) -> None:
+        """Swap in a fresh pool once a worker died; otherwise every later job fails."""
+        with self._pool_lock:
+            if self._pool is not broken or self._stopping:
+                return
+            broken.shutdown(wait=False, cancel_futures=True)
+            self._pool = self._new_pool()
+        log.warning("render worker died (likely out of memory) - pool restarted")
 
     def shutdown(self) -> None:
         self._stopping = True
@@ -229,7 +274,7 @@ class JobManager:
             if job.cancel_requested:
                 raise JobCancelled()
 
-            page_count, needs_pass = inspect_pdf(str(job.pdf_path))
+            page_count, needs_pass, sizes = inspect_pdf(str(job.pdf_path))
             if needs_pass:
                 raise ValueError("This PDF is password protected and cannot be opened.")
             if page_count < 1:
@@ -239,10 +284,23 @@ class JobManager:
                     f"PDF has {page_count} pages, the limit is {config.MAX_PAGES}."
                 )
 
-            job.update(total_pages=page_count, stage="rendering")
+            job.update(total_pages=page_count, page_sizes=sizes, stage="rendering")
             job.note(f"{page_count} page(s) detected - rendering at {job.dpi} DPI")
 
-            zip_path = self._render_and_pack(job)
+            try:
+                zip_path = self._render_and_pack(job, solo=False)
+            except BrokenProcessPool:
+                if job.cancel_requested:
+                    raise JobCancelled() from None
+                job.update(done_pages=0, bytes_written=0)
+                job.note("A render worker ran out of memory - retrying one page at a time")
+                try:
+                    zip_path = self._render_and_pack(job, solo=True)
+                except BrokenProcessPool:
+                    raise RuntimeError(
+                        "A page is too large to render in the memory available. "
+                        "Try a lower DPI or grayscale output."
+                    ) from None
             if job.cancel_requested:
                 raise JobCancelled()
 
@@ -268,7 +326,7 @@ class JobManager:
             job.note(f"Error: {exc}")
             self._discard_workdir(job)
 
-    def _render_and_pack(self, job: Job) -> Path:
+    def _render_and_pack(self, job: Job, solo: bool) -> Path:
         """Render every page and stream it straight into the archive.
 
         Pages are added to the ZIP and deleted as soon as they are rendered,
@@ -276,7 +334,6 @@ class JobManager:
         two, and there is no long silent packaging phase at the end - which on
         a 10 000 page document looked exactly like the job had hung.
         """
-        assert self._pool is not None
         out_dir = job.dir / "tif"
         stem = _safe_stem(job.original_name)
         zip_path = job.dir / f"{stem}_tiff.zip"
@@ -298,7 +355,7 @@ class JobManager:
         step = max(1, min(50, job.total_pages // 20 or 1))
 
         with zipfile.ZipFile(zip_path, "w", compression=mode, allowZip64=True) as archive:
-            for filename, written in self._render_stream(job, spec):
+            for filename, written in self._render_stream(job, spec, solo):
                 page_file = out_dir / filename
                 archive.write(page_file, arcname=filename)
                 page_file.unlink(missing_ok=True)
@@ -316,35 +373,57 @@ class JobManager:
         shutil.rmtree(out_dir, ignore_errors=True)
         return zip_path
 
-    def _render_stream(self, job: Job, spec: RenderSpec):
+    def _render_stream(self, job: Job, spec: RenderSpec, solo: bool):
         """Yield (filename, bytes) per page, keeping only a few pages in flight.
 
         Submitting all 10 000 tasks up front would pickle and queue the lot,
         and cancelling would have to walk every one of them. A sliding window
-        keeps memory flat and stops the moment a cancel arrives.
+        keeps memory flat and stops the moment a cancel arrives. Pages are
+        also held back until their estimated memory fits the shared budget.
         """
-        assert self._pool is not None
-        window = max(2, config.RENDER_WORKERS * config.INFLIGHT_PER_WORKER)
+        pool = self._current_pool()
+        window = 1 if solo else max(2, config.RENDER_WORKERS * config.INFLIGHT_PER_WORKER)
         next_page = 0
         pending: set[Future] = set()
 
         def fill() -> None:
             nonlocal next_page
             while len(pending) < window and next_page < job.total_pages:
-                pending.add(self._pool.submit(render_page, spec, next_page))
+                width, height = job.page_sizes[next_page]
+                cost = estimate_render_bytes(
+                    width, height, spec.dpi, spec.color_mode, spec.max_pixels
+                )
+                granted = self._budget.try_acquire(cost)
+                if not granted:
+                    return
+                try:
+                    future = pool.submit(render_page, spec, next_page)
+                except BaseException:
+                    self._budget.release(granted)
+                    raise
+                future.add_done_callback(lambda _f, g=granted: self._budget.release(g))
+                pending.add(future)
                 next_page += 1
 
         try:
             fill()
-            while pending:
+            while pending or next_page < job.total_pages:
                 if job.cancel_requested:
                     raise JobCancelled()
+                if not pending:
+                    # Another job holds the budget; wait for it to free up.
+                    time.sleep(0.25)
+                    fill()
+                    continue
                 finished, _ = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
                 for future in finished:
                     pending.discard(future)
                     _index, filename, written = future.result()
                     yield filename, written
                 fill()
+        except BrokenProcessPool:
+            self._replace_pool(pool)
+            raise
         finally:
             for future in pending:
                 future.cancel()

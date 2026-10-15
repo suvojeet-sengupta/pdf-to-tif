@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#12100e">
 <meta name="color-scheme" content="dark light">
 <title>Pagesmith · PDF to TIFF</title>
-<link rel="stylesheet" href="/style.css?v=2">
+<link rel="stylesheet" href="/style.css?v=3">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23e8863a'/><path d='M9 8h9l5 5v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z' fill='%2318140f'/><path d='M11 17h10M11 21h7' stroke='%23e8863a' stroke-width='2' stroke-linecap='round'/></svg>">
 </head>
 <body>
@@ -60,22 +60,15 @@
       </div>
 
       <label id="drop" class="drop" for="file" tabindex="0">
-        <input type="file" id="file" accept="application/pdf,.pdf" hidden>
+        <input type="file" id="file" accept="application/pdf,.pdf" multiple hidden>
         <span class="drop__glyph" aria-hidden="true">
           <svg viewBox="0 0 24 24"><path d="M12 15V4m0 0 4 4m-4-4L8 8"/><path d="M4 14v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg>
         </span>
-        <b>Drop a PDF</b>
-        <small>or tap to browse · up to <span id="maxSize">—</span> MB</small>
+        <b>Drop PDFs</b>
+        <small>or tap to browse · up to <span id="maxFiles">5</span> files · <span id="maxSize">—</span> MB each</small>
       </label>
 
-      <div id="chosen" class="chosen" hidden>
-        <span class="chosen__ext">PDF</span>
-        <span class="chosen__meta">
-          <b id="chosenName">—</b>
-          <small id="chosenSize"></small>
-        </span>
-        <button type="button" class="btn btn--icon" id="clearFile" aria-label="Remove file">✕</button>
-      </div>
+      <ul id="chosen" class="chosen-list"></ul>
 
       <div class="panel__head panel__head--sub">
         <span class="step">02</span>
@@ -145,7 +138,7 @@
           <span></span><span></span><span></span><span></span>
           <span></span><span></span><span></span><span></span>
         </div>
-        <p>Nothing running. Pick a PDF to start.</p>
+        <p>Nothing running. Pick up to 5 PDFs to start — they convert one after another.</p>
         <small>A conversion keeps going even if you close this tab — reopen it and you land right back here.</small>
       </div>
 
@@ -260,6 +253,6 @@
     }, 5000);
   })();
 </script>
-<script src="/app.js?v=2"></script>
+<script src="/app.js?v=3"></script>
 </body>
 </html>

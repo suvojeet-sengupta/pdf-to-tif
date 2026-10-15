@@ -36,8 +36,12 @@ MAX_PAGES = _int("MAX_PAGES", 10000)
 JOB_TTL_MINUTES = _int("JOB_TTL_MINUTES", 120)
 CLEANUP_INTERVAL_SECONDS = _int("CLEANUP_INTERVAL_SECONDS", 300)
 
-# How many jobs may render at the same time.
-MAX_CONCURRENT_JOBS = max(1, _int("MAX_CONCURRENT_JOBS", 2))
+# How many jobs may render at the same time. One keeps a multi-file batch
+# strictly sequential and gives each PDF the whole memory budget.
+MAX_CONCURRENT_JOBS = max(1, _int("MAX_CONCURRENT_JOBS", 1))
+
+# Files the UI lets you queue in one go.
+MAX_BATCH_FILES = max(1, _int("MAX_BATCH_FILES", 5))
 
 DEFAULT_DPI = _int("DEFAULT_DPI", 200)
 MIN_DPI = 72
@@ -94,6 +98,26 @@ DISK_CHECK_EVERY = _int("DISK_CHECK_EVERY", 25)
 # A single page that renders to more than this many pixels is scaled down
 # instead of exhausting the worker's memory (a 600 dpi A0 sheet is ~1.4 GB).
 MAX_PAGE_PIXELS = _int("MAX_PAGE_PIXELS", 120_000_000)
+
+
+def _container_memory_limit() -> int:
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if raw.isdigit() and int(raw) < 1 << 50:
+            return int(raw)
+    return 0
+
+
+# Estimated bytes all render workers together may hold at once. Pages are only
+# dispatched while they fit, so a batch of huge sheets renders one or two at a
+# time instead of all workers allocating together and tripping the OOM killer.
+_limit = _container_memory_limit()
+RENDER_MEMORY_BYTES = _int(
+    "RENDER_MEMORY_MB", int(_limit * 0.8) // (1024 * 1024) if _limit else 2048
+) * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Chunked uploads

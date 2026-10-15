@@ -1,7 +1,6 @@
 """Page rendering. Runs inside the render worker processes."""
 from __future__ import annotations
 
-import io
 import os
 from dataclasses import dataclass
 
@@ -80,32 +79,52 @@ def _get_doc(path: str) -> fitz.Document:
     return doc
 
 
+def effective_zoom(width_pt: float, height_pt: float, dpi: int, max_pixels: int) -> float:
+    """Zoom for a page, scaled down so huge sheets stay under `max_pixels`."""
+    zoom = dpi / 72.0
+    pixels = (width_pt * zoom) * (height_pt * zoom)
+    if max_pixels and pixels > max_pixels:
+        zoom *= (max_pixels / pixels) ** 0.5
+    return zoom
+
+
+# Peak worker RSS measured on 24x36in banners: ~14 B/px colour, ~9 B/px grey.
+_WORKER_BASE_BYTES = 100 * 1024 * 1024
+_BYTES_PER_PIXEL = {"color": 15, "gray": 9, "bw": 9}
+
+
+def estimate_render_bytes(
+    width_pt: float, height_pt: float, dpi: int, color_mode: str, max_pixels: int
+) -> int:
+    zoom = effective_zoom(width_pt, height_pt, dpi, max_pixels)
+    pixels = (width_pt * zoom) * (height_pt * zoom)
+    return int(_WORKER_BASE_BYTES + pixels * _BYTES_PER_PIXEL.get(color_mode, 15))
+
+
 def render_page(spec: RenderSpec, page_index: int) -> tuple[int, str, int]:
     """Render one PDF page to a TIFF file. Returns (index, filename, bytes)."""
     doc = _get_doc(spec.pdf_path)
     page = doc.load_page(page_index)
 
-    zoom = spec.dpi / 72.0
-    # Very large sheets at high DPI can ask for gigabytes of pixmap. Scale the
-    # zoom down to a sane ceiling rather than letting the worker die.
     rect = page.rect
-    pixels = (rect.width * zoom) * (rect.height * zoom)
-    if spec.max_pixels and pixels > spec.max_pixels:
-        zoom *= (spec.max_pixels / pixels) ** 0.5
-
+    zoom = effective_zoom(rect.width, rect.height, spec.dpi, spec.max_pixels)
     matrix = fitz.Matrix(zoom, zoom)
     grayscale = spec.color_mode in ("gray", "bw")
     colorspace = fitz.csGRAY if grayscale else fitz.csRGB
 
     pix = page.get_pixmap(matrix=matrix, colorspace=colorspace, alpha=False)
+    # samples_mv is a view on the pixmap; `samples` would add a third full copy.
     image = Image.frombytes(
-        "L" if grayscale else "RGB", (pix.width, pix.height), pix.samples
+        "L" if grayscale else "RGB", (pix.width, pix.height), pix.samples_mv
     )
-    pix = None  # release the pixmap buffer as early as possible
+    pix = None
+    page = None
 
     if spec.color_mode == "bw":
         # A fixed threshold keeps scanned text crisp; dithering would smear it.
-        image = image.point(lambda v: 255 if v > BW_THRESHOLD else 0, mode="1")
+        bilevel = image.point(lambda v: 255 if v > BW_THRESHOLD else 0, mode="1")
+        image.close()
+        image = bilevel
         compression = BW_COMPRESSION
     else:
         compression = COMPRESSIONS[spec.compression]
@@ -113,25 +132,24 @@ def render_page(spec: RenderSpec, page_index: int) -> tuple[int, str, int]:
     filename = f"{spec.prefix}_page_{page_index + 1:0{spec.pad}d}.tif"
     out_path = os.path.join(spec.out_dir, filename)
 
-    buffer = io.BytesIO()
     effective_dpi = max(1, round(72 * zoom))
     image.save(
-        buffer,
+        out_path,
         format="TIFF",
         compression=compression,
         dpi=(effective_dpi, effective_dpi),
     )
-    data = buffer.getvalue()
-    with open(out_path, "wb") as handle:
-        handle.write(data)
-
     image.close()
-    return page_index, filename, len(data)
+    return page_index, filename, os.path.getsize(out_path)
 
 
-def inspect_pdf(path: str) -> tuple[int, bool]:
-    """Return (page_count, needs_password) without rendering anything."""
+def inspect_pdf(path: str) -> tuple[int, bool, list[tuple[float, float]]]:
+    """Return (page_count, needs_password, page sizes in points) without rendering."""
     with fitz.open(path) as doc:
         if doc.needs_pass:
-            return 0, True
-        return doc.page_count, False
+            return 0, True, []
+        sizes = []
+        for index in range(doc.page_count):
+            rect = doc.load_page(index).rect
+            sizes.append((rect.width, rect.height))
+        return doc.page_count, False, sizes

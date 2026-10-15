@@ -99,6 +99,7 @@ async def api_config(request: Request) -> dict:
         "render_workers": config.RENDER_WORKERS,
         "job_ttl_minutes": config.JOB_TTL_MINUTES,
         "chunk_size": config.UPLOAD_CHUNK_BYTES,
+        "max_batch_files": config.MAX_BATCH_FILES,
     }
 
 

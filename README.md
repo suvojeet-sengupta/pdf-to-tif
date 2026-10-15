@@ -166,7 +166,9 @@ All settings are environment variables — set them in `docker-compose.yml`.
 | `LIBRARY_LIMIT` | `40` | Jobs listed in the library |
 | `PORT` | `9000` | HTTP port inside the container |
 | `RENDER_WORKERS` | `min(8, cores)` | Worker processes rendering pages in parallel |
-| `MAX_CONCURRENT_JOBS` | `2` | How many PDFs may convert at the same time |
+| `MAX_CONCURRENT_JOBS` | `1` | How many PDFs may convert at the same time (1 = a batch converts one by one) |
+| `MAX_BATCH_FILES` | `5` | PDFs the UI lets you pick and queue in one go |
+| `RENDER_MEMORY_MB` | 80% of the container limit | Estimated memory all page renders may hold at once; large sheets are dispatched only while they fit |
 | `MAX_UPLOAD_MB` | `500` | Rejected above this size |
 | `MAX_PAGES` | `10000` | Page-count ceiling per PDF |
 | `JOB_TTL_MINUTES` | `120` | How long a finished ZIP stays downloadable |

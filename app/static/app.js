@@ -13,8 +13,8 @@ const el = {
   workspace: $('workspace'), logout: $('logout'), tagWorkers: $('tagWorkers'),
   maxSize: $('maxSize'), ttl: $('ttl'),
 
-  drop: $('drop'), file: $('file'), chosen: $('chosen'), chosenName: $('chosenName'),
-  chosenSize: $('chosenSize'), clearFile: $('clearFile'), pickError: $('pickError'),
+  drop: $('drop'), file: $('file'), chosen: $('chosen'), maxFiles: $('maxFiles'),
+  pickError: $('pickError'),
   dpi: $('dpi'), color: $('color'), compression: $('compression'),
   zipCompress: $('zipCompress'), autoDelete: $('autoDelete'), start: $('start'),
 
@@ -38,7 +38,10 @@ const LIBRARY_POLL_MS = 4000;
 const STALL_AFTER_MS = 45000;  // no upload progress for this long = dead link
 
 const state = {
-  file: null,
+  files: [],       // picked, not yet handed to the server
+  file: null,      // the one currently uploading
+  batch: [],       // job ids from the last Convert, converted in order
+  maxFiles: 5,
   jobId: null,
   stream: null,
   poller: null,
@@ -148,22 +151,55 @@ el.logout.addEventListener('click', async () => {
   showGate();
 });
 
-/* ── choosing a file ──────────────────────────────────────────────────── */
-function setFile(file) {
+/* ── choosing files ───────────────────────────────────────────────────── */
+function addFiles(list) {
   el.pickError.hidden = true;
-  if (!file) return;
-  if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') {
-    return pickError('That is not a PDF.');
+  const problems = [];
+  for (const file of Array.from(list || [])) {
+    if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') {
+      problems.push(`${file.name} is not a PDF.`);
+    } else if (file.size > state.maxUploadBytes) {
+      problems.push(`${file.name} is over the ${humanBytes(state.maxUploadBytes)} limit.`);
+    } else if (state.files.some((f) => f.name === file.name && f.size === file.size)) {
+      continue;
+    } else if (state.files.length >= state.maxFiles) {
+      problems.push(`Only ${state.maxFiles} files at a time — the rest were skipped.`);
+      break;
+    } else {
+      state.files.push(file);
+    }
   }
-  if (file.size > state.maxUploadBytes) {
-    return pickError(`${humanBytes(file.size)} is over the ${humanBytes(state.maxUploadBytes)} limit.`);
-  }
-  state.file = file;
-  el.chosenName.textContent = file.name;
-  el.chosenSize.textContent = humanBytes(file.size);
-  el.chosen.hidden = false;
-  el.drop.hidden = true;
-  el.start.disabled = false;
+  el.file.value = '';
+  renderChosen();
+  if (problems.length) pickError(problems.join(' '));
+}
+
+function renderChosen() {
+  el.chosen.replaceChildren(...state.files.map((file, index) => {
+    const row = document.createElement('li');
+    row.className = 'chosen';
+    const ext = document.createElement('span');
+    ext.className = 'chosen__ext';
+    ext.textContent = state.files.length > 1 ? String(index + 1) : 'PDF';
+    const meta = document.createElement('span');
+    meta.className = 'chosen__meta';
+    const name = document.createElement('b');
+    name.textContent = file.name;
+    const size = document.createElement('small');
+    size.textContent = humanBytes(file.size);
+    meta.append(name, size);
+    const remove = button('✕', 'btn btn--icon', () => {
+      if (state.uploading) return;
+      state.files.splice(index, 1);
+      renderChosen();
+    });
+    remove.setAttribute('aria-label', `Remove ${file.name}`);
+    row.append(ext, meta, remove);
+    return row;
+  }));
+  el.drop.hidden = state.files.length >= state.maxFiles;
+  el.start.disabled = !state.files.length || state.uploading;
+  el.start.textContent = state.files.length > 1 ? `Convert ${state.files.length} PDFs` : 'Convert';
 }
 
 function pickError(message) {
@@ -171,16 +207,14 @@ function pickError(message) {
   el.pickError.hidden = false;
 }
 
-function clearFile() {
+function clearFiles() {
+  state.files = [];
   state.file = null;
   el.file.value = '';
-  el.chosen.hidden = true;
-  el.drop.hidden = false;
-  el.start.disabled = true;
+  renderChosen();
 }
 
-el.file.addEventListener('change', () => setFile(el.file.files[0]));
-el.clearFile.addEventListener('click', clearFile);
+el.file.addEventListener('change', () => addFiles(el.file.files));
 el.drop.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.file.click(); }
 });
@@ -189,13 +223,13 @@ el.drop.addEventListener('keydown', (e) => {
   el.drop.addEventListener(type, (e) => { e.preventDefault(); el.drop.classList.add('over'); }));
 ['dragleave', 'drop'].forEach((type) =>
   el.drop.addEventListener(type, (e) => { e.preventDefault(); el.drop.classList.remove('over'); }));
-el.drop.addEventListener('drop', (e) => setFile(e.dataTransfer.files[0]));
+el.drop.addEventListener('drop', (e) => { e.stopPropagation(); addFiles(e.dataTransfer.files); });
 
 document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => {
   e.preventDefault();
   if (!el.workspace.hidden && !el.drop.hidden && e.dataTransfer.files.length) {
-    setFile(e.dataTransfer.files[0]);
+    addFiles(e.dataTransfer.files);
   }
 });
 
@@ -242,23 +276,58 @@ function rememberedUpload() {
   } catch (_) { return null; }
 }
 
+/* Files go up one after another; each becomes a job the moment it lands, and
+   the server converts the queue one PDF at a time. A failed upload leaves the
+   remaining files picked so "Try again" carries on from there. */
 async function startUpload() {
-  if (!state.file || state.uploading) return;
-  const file = state.file;
+  if (!state.files.length || state.uploading) return;
+  if (!state.retrying) state.batch = [];
+  state.retrying = false;
 
   liveView('run');
-  resetRunView(`${file.name} · ${humanBytes(file.size)}`);
   el.start.disabled = true;
   el.retryUpload.hidden = true;
-
   state.uploading = true;
   state.cancelled = false;
+  startStallWatch();
+
+  const total = state.files.length;
+  let index = 0;
+  try {
+    while (state.files.length) {
+      index += 1;
+      const file = state.files[0];
+      state.file = file;
+      const tag = total > 1 ? `File ${index} of ${total} · ` : '';
+      resetRunView(`${tag}${file.name} · ${humanBytes(file.size)}`);
+      const jobId = await uploadOne(file);
+      state.batch.push(jobId);
+      state.files.shift();
+      renderChosen();
+      refreshLibrary();
+    }
+    state.file = null;
+    finishUpload();
+    const first = state.batch.find(Boolean);
+    if (first) watch(first);
+  } catch (err) {
+    finishUpload();
+    if (err.auth || err.message === 'unauthenticated') return;   // gate already shown
+    if (err.aborted || state.cancelled) {
+      await discardUpload();
+      backToIdle();
+      return;
+    }
+    state.retrying = true;
+    showUploadFailure(uploadMessage(err), true);
+  }
+}
+
+async function uploadOne(file) {
   state.uploadStart = Date.now();
   state.lastProgressAt = Date.now();
   state.baseBytes = 0;
-  startStallWatch();
-
-  try {
+  {
     let session = null;
     let offset = 0;
 
@@ -329,19 +398,7 @@ async function startUpload() {
     const created = await api(`/api/uploads/${state.uploadId}/finish`, { method: 'POST' });
     forgetUpload();
     state.uploadId = null;
-    state.jobId = created.job_id;
-    finishUpload();
-    watch(created.job_id);
-    refreshLibrary();
-  } catch (err) {
-    finishUpload();
-    if (err.auth || err.message === 'unauthenticated') return;   // gate already shown
-    if (err.aborted || state.cancelled) {
-      await discardUpload();
-      backToIdle();
-      return;
-    }
-    showUploadFailure(uploadMessage(err), true);
+    return created.job_id;
   }
 }
 
@@ -422,7 +479,7 @@ function uploadMessage(err) {
 function finishUpload() {
   state.uploading = false;
   state.xhr = null;
-  el.start.disabled = !state.file;
+  el.start.disabled = !state.files.length;
   clearInterval(state.stallTimer);
   state.stallTimer = null;
 }
@@ -439,7 +496,7 @@ function startStallWatch() {
 
 function showUploadFailure(message, offerRetry) {
   el.failMessage.textContent = message;
-  el.retryUpload.hidden = !offerRetry || !state.file;
+  el.retryUpload.hidden = !offerRetry || !state.files.length;
   el.retryUpload.textContent = state.uploadId ? 'Resume upload' : 'Try again';
   liveView('fail');
 }
@@ -536,14 +593,33 @@ function paintMosaic(done) {
   for (let i = 0; i < tiles.length; i += 1) tiles[i].classList.toggle('on', i < done);
 }
 
+function nextInBatch(afterId) {
+  const at = state.batch.indexOf(afterId);
+  return at >= 0 && at < state.batch.length - 1 ? state.batch[at + 1] : null;
+}
+
+function batchLabel(id) {
+  const at = state.batch.indexOf(id);
+  return state.batch.length > 1 && at >= 0 ? `PDF ${at + 1} of ${state.batch.length} · ` : '';
+}
+
 function paint(s) {
+  const next = s.stage === 'done' || s.stage === 'error' ? nextInBatch(s.id) : null;
+  if (next) {
+    // Move straight on to the next PDF; the finished one stays in the library.
+    stopWatching();
+    refreshLibrary();
+    resetRunView('');
+    watch(next);
+    return;
+  }
   if (s.total_pages) buildMosaic(s.total_pages);
 
   statLabels('Pages', 'Rate', 'Elapsed', 'Left', 'Written');
   el.stageLabel.textContent = s.stage_label;
   el.percent.innerHTML = `${Math.round(s.percent)}<i>%</i>`;
   el.barFill.style.width = `${s.percent}%`;
-  el.fileLabel.textContent = s.original_name;
+  el.fileLabel.textContent = `${batchLabel(s.id)}${s.original_name}`;
   el.statPages.textContent = `${s.done_pages}/${s.total_pages || '—'}`;
   el.statRate.textContent = s.rate ? `${s.rate.toFixed(1)}/s` : '—';
   el.statElapsed.textContent = humanTime(s.elapsed);
@@ -561,8 +637,9 @@ function paint(s) {
     stopWatching();
     el.download.href = s.download_url;
     el.download.setAttribute('download', s.zip_name);
-    el.resultTitle.textContent =
-      `${s.total_pages} TIFF${s.total_pages === 1 ? '' : 's'} ready`;
+    el.resultTitle.textContent = state.batch.length > 1
+      ? `All ${state.batch.length} PDFs processed — download each one below`
+      : `${s.total_pages} TIFF${s.total_pages === 1 ? '' : 's'} ready`;
     el.resultSummary.textContent =
       `${s.zip_name} · ${humanBytes(s.zip_size)} · ${s.dpi} dpi · ${humanTime(s.elapsed)}`;
     el.autoNote.hidden = !s.auto_delete;
@@ -605,7 +682,9 @@ function backToIdle() {
   finishUpload();
   el.retryUpload.hidden = true;
   state.jobId = null;
-  clearFile();
+  state.batch = [];
+  state.retrying = false;
+  clearFiles();
   liveView('idle');
   refreshLibrary();
 }
@@ -654,7 +733,8 @@ async function refreshLibrary() {
 
   // Reconnect to a conversion that is still running (e.g. after a reload).
   if (!state.attached) {
-    const running = jobs.find((job) => job.active);
+    const running = jobs.find((job) => job.active && job.stage !== 'queued')
+      || jobs.find((job) => job.active);
     const showingResult = !el.liveDone.hidden || !el.liveFail.hidden;
     if (running) {
       liveView('run');
@@ -735,6 +815,8 @@ el.refreshJobs.addEventListener('click', refreshLibrary);
   }
 
   state.maxUploadBytes = (cfg.max_upload_mb || 500) * 1024 * 1024;
+  state.maxFiles = cfg.max_batch_files || 5;
+  el.maxFiles.textContent = state.maxFiles;
   el.maxSize.textContent = cfg.max_upload_mb ?? '—';
   el.ttl.textContent = cfg.job_ttl_minutes ?? '—';
   el.tagWorkers.textContent = `${cfg.render_workers || '?'} workers`;
