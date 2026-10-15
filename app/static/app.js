@@ -14,6 +14,7 @@ const el = {
   maxSize: $('maxSize'), ttl: $('ttl'),
 
   drop: $('drop'), file: $('file'), chosen: $('chosen'), maxFiles: $('maxFiles'),
+  folder: $('folder'), pickFolder: $('pickFolder'),
   pickError: $('pickError'),
   dpi: $('dpi'), color: $('color'), compression: $('compression'),
   zipCompress: $('zipCompress'), autoDelete: $('autoDelete'), start: $('start'),
@@ -41,6 +42,9 @@ const state = {
   files: [],       // picked, not yet handed to the server
   file: null,      // the one currently uploading
   batch: [],       // job ids from the last Convert, converted in order
+  folder: null,    // { name, files } when a whole folder was picked
+  folderUploads: [],
+  maxFolderFiles: 1000,
   maxFiles: 5,
   jobId: null,
   stream: null,
@@ -154,6 +158,7 @@ el.logout.addEventListener('click', async () => {
 /* ── choosing files ───────────────────────────────────────────────────── */
 function addFiles(list) {
   el.pickError.hidden = true;
+  state.folder = null;
   const problems = [];
   for (const file of Array.from(list || [])) {
     if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') {
@@ -174,7 +179,62 @@ function addFiles(list) {
   if (problems.length) pickError(problems.join(' '));
 }
 
+function setFolder(list) {
+  el.pickError.hidden = true;
+  const all = Array.from(list || []);
+  el.folder.value = '';
+  if (!all.length) return;
+  const files = all
+    .filter((f) => /\.pdf$/i.test(f.name))
+    .sort((a, b) => (a.webkitRelativePath || a.name)
+      .localeCompare(b.webkitRelativePath || b.name, undefined, { numeric: true }));
+  const name = (all[0].webkitRelativePath || '').split('/')[0] || 'folder';
+  if (!files.length) return pickError(`No PDFs found in “${name}”.`);
+  if (files.length > state.maxFolderFiles) {
+    return pickError(`“${name}” has ${files.length} PDFs; the limit is ${state.maxFolderFiles}.`);
+  }
+  const big = files.find((f) => f.size > state.maxUploadBytes);
+  if (big) return pickError(`${big.name} is over the ${humanBytes(state.maxUploadBytes)} limit.`);
+  state.files = [];
+  state.folder = { name, files };
+  renderChosen();
+}
+
+function renderFolderRow() {
+  const { name, files } = state.folder;
+  const row = document.createElement('li');
+  row.className = 'chosen';
+  const ext = document.createElement('span');
+  ext.className = 'chosen__ext';
+  ext.textContent = 'DIR';
+  const meta = document.createElement('span');
+  meta.className = 'chosen__meta';
+  const label = document.createElement('b');
+  label.textContent = name;
+  const size = document.createElement('small');
+  const bytes = files.reduce((sum, f) => sum + f.size, 0);
+  size.textContent = `${files.length} PDF${files.length === 1 ? '' : 's'} · ${humanBytes(bytes)} · each sheet → its own TIFF`;
+  meta.append(label, size);
+  const remove = button('✕', 'btn btn--icon', () => {
+    if (state.uploading) return;
+    state.folder = null;
+    renderChosen();
+  });
+  remove.setAttribute('aria-label', 'Remove folder');
+  row.append(ext, meta, remove);
+  return row;
+}
+
 function renderChosen() {
+  if (state.folder) {
+    el.chosen.replaceChildren(renderFolderRow());
+    el.drop.hidden = true;
+    el.pickFolder.hidden = true;
+    el.start.disabled = state.uploading;
+    el.start.textContent = `Convert folder (${state.folder.files.length} PDFs)`;
+    return;
+  }
+  el.pickFolder.hidden = state.files.length > 0;
   el.chosen.replaceChildren(...state.files.map((file, index) => {
     const row = document.createElement('li');
     row.className = 'chosen';
@@ -209,12 +269,17 @@ function pickError(message) {
 
 function clearFiles() {
   state.files = [];
+  state.folder = null;
+  state.folderUploads = [];
+  el.folder.value = '';
   state.file = null;
   el.file.value = '';
   renderChosen();
 }
 
 el.file.addEventListener('change', () => addFiles(el.file.files));
+el.folder.addEventListener('change', () => setFolder(el.folder.files));
+el.pickFolder.addEventListener('click', () => el.folder.click());
 el.drop.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.file.click(); }
 });
@@ -280,6 +345,7 @@ function rememberedUpload() {
    the server converts the queue one PDF at a time. A failed upload leaves the
    remaining files picked so "Try again" carries on from there. */
 async function startUpload() {
+  if (state.folder) return startFolderUpload();
   if (!state.files.length || state.uploading) return;
   if (!state.retrying) state.batch = [];
   state.retrying = false;
@@ -323,7 +389,64 @@ async function startUpload() {
   }
 }
 
-async function uploadOne(file) {
+/* A folder: every PDF goes up first, then the server turns the lot into one
+   job whose ZIP holds a TIFF per sheet. A retry skips files already sent. */
+async function startFolderUpload() {
+  if (state.uploading) return;
+  const { name, files } = state.folder;
+  if (!state.retrying) state.folderUploads = [];
+  state.retrying = false;
+  state.batch = [];
+
+  liveView('run');
+  el.start.disabled = true;
+  el.retryUpload.hidden = true;
+  state.uploading = true;
+  state.cancelled = false;
+  startStallWatch();
+
+  try {
+    for (let i = state.folderUploads.length; i < files.length; i += 1) {
+      const file = files[i];
+      state.file = file;
+      resetRunView(`${name} · PDF ${i + 1} of ${files.length} · ${file.name}`);
+      state.folderUploads.push(await uploadOne(file, false));
+    }
+    paintHandoff();
+    const created = await api('/api/folder-jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, upload_ids: state.folderUploads }),
+    });
+    state.folderUploads = [];
+    state.folder = null;
+    state.file = null;
+    finishUpload();
+    renderChosen();
+    watch(created.job_id);
+    refreshLibrary();
+  } catch (err) {
+    finishUpload();
+    if (err.auth || err.message === 'unauthenticated') return;
+    if (err.aborted || state.cancelled) {
+      await discardUpload();
+      await discardFolderUploads();
+      backToIdle();
+      return;
+    }
+    state.retrying = true;
+    showUploadFailure(uploadMessage(err), true);
+  }
+}
+
+async function discardFolderUploads() {
+  const ids = state.folderUploads;
+  state.folderUploads = [];
+  await Promise.all(ids.map((id) =>
+    api(`/api/uploads/${id}`, { method: 'DELETE' }).catch(() => {})));
+}
+
+async function uploadOne(file, finish = true) {
   state.uploadStart = Date.now();
   state.lastProgressAt = Date.now();
   state.baseBytes = 0;
@@ -394,6 +517,12 @@ async function uploadOne(file) {
       paintUpload(offset, file.size);
     }
 
+    if (!finish) {
+      const id = state.uploadId;
+      forgetUpload();
+      state.uploadId = null;
+      return id;
+    }
     paintHandoff();
     const created = await api(`/api/uploads/${state.uploadId}/finish`, { method: 'POST' });
     forgetUpload();
@@ -479,7 +608,7 @@ function uploadMessage(err) {
 function finishUpload() {
   state.uploading = false;
   state.xhr = null;
-  el.start.disabled = !state.files.length;
+  el.start.disabled = !state.files.length && !state.folder;
   clearInterval(state.stallTimer);
   state.stallTimer = null;
 }
@@ -496,7 +625,7 @@ function startStallWatch() {
 
 function showUploadFailure(message, offerRetry) {
   el.failMessage.textContent = message;
-  el.retryUpload.hidden = !offerRetry || !state.files.length;
+  el.retryUpload.hidden = !offerRetry || (!state.files.length && !state.folder);
   el.retryUpload.textContent = state.uploadId ? 'Resume upload' : 'Try again';
   liveView('fail');
 }
@@ -816,6 +945,7 @@ el.refreshJobs.addEventListener('click', refreshLibrary);
 
   state.maxUploadBytes = (cfg.max_upload_mb || 500) * 1024 * 1024;
   state.maxFiles = cfg.max_batch_files || 5;
+  state.maxFolderFiles = cfg.max_folder_files || 1000;
   el.maxFiles.textContent = state.maxFiles;
   el.maxSize.textContent = cfg.max_upload_mb ?? '—';
   el.ttl.textContent = cfg.job_ttl_minutes ?? '—';

@@ -42,6 +42,8 @@ class RenderSpec:
     compression: str
     pad: int
     max_pixels: int = 120_000_000
+    # One-page source in a folder job: name the TIFF after the PDF itself.
+    single: bool = False
 
 
 def normalise_options(dpi, color_mode, compression, min_dpi, max_dpi, default_dpi):
@@ -129,7 +131,10 @@ def render_page(spec: RenderSpec, page_index: int) -> tuple[int, str, int]:
     else:
         compression = COMPRESSIONS[spec.compression]
 
-    filename = f"{spec.prefix}_page_{page_index + 1:0{spec.pad}d}.tif"
+    if spec.single:
+        filename = f"{spec.prefix}.tif"
+    else:
+        filename = f"{spec.prefix}_page_{page_index + 1:0{spec.pad}d}.tif"
     out_path = os.path.join(spec.out_dir, filename)
 
     effective_dpi = max(1, round(72 * zoom))

@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#12100e">
 <meta name="color-scheme" content="dark light">
 <title>Pagesmith · PDF to TIFF</title>
-<link rel="stylesheet" href="/style.css?v=3">
+<link rel="stylesheet" href="/style.css?v=4">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23e8863a'/><path d='M9 8h9l5 5v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z' fill='%2318140f'/><path d='M11 17h10M11 21h7' stroke='%23e8863a' stroke-width='2' stroke-linecap='round'/></svg>">
 </head>
 <body>
@@ -67,6 +67,11 @@
         <b>Drop PDFs</b>
         <small>or tap to browse · up to <span id="maxFiles">5</span> files · <span id="maxSize">—</span> MB each</small>
       </label>
+
+      <input type="file" id="folder" webkitdirectory directory multiple hidden>
+      <button type="button" class="btn btn--quiet btn--full" id="pickFolder">
+        Or select a folder of PDF sheets → one ZIP of TIFFs
+      </button>
 
       <ul id="chosen" class="chosen-list"></ul>
 
@@ -253,6 +258,6 @@
     }, 5000);
   })();
 </script>
-<script src="/app.js?v=3"></script>
+<script src="/app.js?v=4"></script>
 </body>
 </html>

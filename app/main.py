@@ -100,6 +100,7 @@ async def api_config(request: Request) -> dict:
         "job_ttl_minutes": config.JOB_TTL_MINUTES,
         "chunk_size": config.UPLOAD_CHUNK_BYTES,
         "max_batch_files": config.MAX_BATCH_FILES,
+        "max_folder_files": config.MAX_FOLDER_FILES,
     }
 
 
@@ -303,6 +304,55 @@ async def upload_finish(upload_id: str) -> JSONResponse:
 
     manager.submit(job)
     log.info("job %s accepted from upload %s (%s)", job.id, upload_id, upload.filename)
+    return JSONResponse({"job_id": job.id, "status_url": f"/api/events/{job.id}"})
+
+
+class FolderFinish(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    upload_ids: list[str] = Field(min_length=1)
+
+
+@app.post("/api/folder-jobs", dependencies=[Guarded])
+async def folder_finish(body: FolderFinish) -> JSONResponse:
+    """Turn a set of completed uploads into one job: every page of every PDF
+    becomes its own TIFF, all packed into a single ZIP."""
+    if len(body.upload_ids) > config.MAX_FOLDER_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A folder can hold at most {config.MAX_FOLDER_FILES} PDFs.",
+        )
+    try:
+        parts = [uploads.store.finish(upload_id) for upload_id in body.upload_ids]
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    options = parts[0].options
+    job = manager.create(
+        original_name=body.name.strip(),
+        dpi=options["dpi"],
+        color_mode=options["color_mode"],
+        compression=options["compression"],
+        zip_compress=options["zip_compress"],
+        auto_delete=options["auto_delete"],
+    )
+    source_dir = job.dir / "sources"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    sources = []
+    try:
+        for index, part in enumerate(parts):
+            target = source_dir / f"{index:05d}.pdf"
+            os.replace(part.path, target)
+            sources.append((part.filename, target))
+    except OSError as exc:
+        shutil.rmtree(job.dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Could not store the upload: {exc}") from exc
+    finally:
+        for upload_id in body.upload_ids:
+            uploads.store.discard(upload_id)
+
+    job.sources = sources
+    manager.submit(job)
+    log.info("folder job %s accepted (%s, %d PDFs)", job.id, job.original_name, len(sources))
     return JSONResponse({"job_id": job.id, "status_url": f"/api/events/{job.id}"})
 
 

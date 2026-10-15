@@ -87,6 +87,9 @@ class Job:
     downloads: int = 0
     log_lines: list[str] = field(default_factory=list)
     page_sizes: list[tuple[float, float]] = field(default_factory=list, repr=False)
+    # Folder jobs: (display name, path) per source PDF. Empty = just pdf_path.
+    sources: list[tuple[str, Path]] = field(default_factory=list, repr=False)
+    page_counts: list[int] = field(default_factory=list, repr=False)
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _version: int = 0
@@ -274,11 +277,16 @@ class JobManager:
             if job.cancel_requested:
                 raise JobCancelled()
 
-            page_count, needs_pass, sizes = inspect_pdf(str(job.pdf_path))
-            if needs_pass:
-                raise ValueError("This PDF is password protected and cannot be opened.")
-            if page_count < 1:
-                raise ValueError("No pages found in this PDF.")
+            if job.sources:
+                page_count, sizes = self._inspect_folder(job)
+            else:
+                page_count, needs_pass, sizes = inspect_pdf(str(job.pdf_path))
+                if needs_pass:
+                    raise ValueError("This PDF is password protected and cannot be opened.")
+                if page_count < 1:
+                    raise ValueError("No pages found in this PDF.")
+                job.sources = [(job.original_name, job.pdf_path)]
+                job.page_counts = [page_count]
             if page_count > config.MAX_PAGES:
                 raise ValueError(
                     f"PDF has {page_count} pages, the limit is {config.MAX_PAGES}."
@@ -314,6 +322,7 @@ class JobManager:
             self._write_meta(job)
             # The rendered pages live inside the archive now.
             shutil.rmtree(job.dir / "tif", ignore_errors=True)
+            shutil.rmtree(job.dir / "sources", ignore_errors=True)
             job.pdf_path.unlink(missing_ok=True)
 
         except JobCancelled:
@@ -326,6 +335,31 @@ class JobManager:
             job.note(f"Error: {exc}")
             self._discard_workdir(job)
 
+    def _inspect_folder(self, job: Job) -> tuple[int, list[tuple[float, float]]]:
+        """Read every source PDF; unreadable ones are skipped with a note."""
+        kept: list[tuple[str, Path]] = []
+        counts: list[int] = []
+        sizes: list[tuple[float, float]] = []
+        for name, path in job.sources:
+            if job.cancel_requested:
+                raise JobCancelled()
+            try:
+                count, needs_pass, page_sizes = inspect_pdf(str(path))
+            except Exception as exc:  # noqa: BLE001
+                job.note(f"Skipped {name}: cannot be opened ({exc})")
+                continue
+            if needs_pass or count < 1:
+                job.note(f"Skipped {name}: {'password protected' if needs_pass else 'no pages'}")
+                continue
+            kept.append((name, path))
+            counts.append(count)
+            sizes.extend(page_sizes)
+        if not kept:
+            raise ValueError("None of the PDFs in this folder could be opened.")
+        job.update(sources=kept, page_counts=counts)
+        job.note(f"{len(kept)} PDF(s) in folder")
+        return sum(counts), sizes
+
     def _render_and_pack(self, job: Job, solo: bool) -> Path:
         """Render every page and stream it straight into the archive.
 
@@ -337,17 +371,27 @@ class JobManager:
         out_dir = job.dir / "tif"
         stem = _safe_stem(job.original_name)
         zip_path = job.dir / f"{stem}_tiff.zip"
-        pad = max(3, len(str(job.total_pages)))
-        spec = RenderSpec(
-            pdf_path=str(job.pdf_path),
-            out_dir=str(out_dir),
-            prefix=stem,
-            dpi=job.dpi,
-            color_mode=job.color_mode,
-            compression=job.compression,
-            pad=pad,
-            max_pixels=config.MAX_PAGE_PIXELS,
-        )
+        folder_job = len(job.sources) > 1 or job.sources[0][1] != job.pdf_path
+        work: list[tuple[RenderSpec, int]] = []
+        used: set[str] = set()
+        for (name, path), count in zip(job.sources, job.page_counts):
+            prefix = _safe_stem(name) if folder_job else stem
+            base, n = prefix, 2
+            while prefix.lower() in used:
+                prefix, n = f"{base}_{n}", n + 1
+            used.add(prefix.lower())
+            spec = RenderSpec(
+                pdf_path=str(path),
+                out_dir=str(out_dir),
+                prefix=prefix,
+                dpi=job.dpi,
+                color_mode=job.color_mode,
+                compression=job.compression,
+                pad=max(3, len(str(count))),
+                max_pixels=config.MAX_PAGE_PIXELS,
+                single=folder_job and count == 1,
+            )
+            work.extend((spec, index) for index in range(count))
 
         mode = zipfile.ZIP_DEFLATED if job.zip_compress else zipfile.ZIP_STORED
         # Stored is the default: the TIFFs are already compressed, so skipping
@@ -355,7 +399,7 @@ class JobManager:
         step = max(1, min(50, job.total_pages // 20 or 1))
 
         with zipfile.ZipFile(zip_path, "w", compression=mode, allowZip64=True) as archive:
-            for filename, written in self._render_stream(job, spec, solo):
+            for filename, written in self._render_stream(job, work, solo):
                 page_file = out_dir / filename
                 archive.write(page_file, arcname=filename)
                 page_file.unlink(missing_ok=True)
@@ -373,7 +417,7 @@ class JobManager:
         shutil.rmtree(out_dir, ignore_errors=True)
         return zip_path
 
-    def _render_stream(self, job: Job, spec: RenderSpec, solo: bool):
+    def _render_stream(self, job: Job, work: list[tuple[RenderSpec, int]], solo: bool):
         """Yield (filename, bytes) per page, keeping only a few pages in flight.
 
         Submitting all 10 000 tasks up front would pickle and queue the lot,
@@ -388,7 +432,8 @@ class JobManager:
 
         def fill() -> None:
             nonlocal next_page
-            while len(pending) < window and next_page < job.total_pages:
+            while len(pending) < window and next_page < len(work):
+                spec, page_index = work[next_page]
                 width, height = job.page_sizes[next_page]
                 cost = estimate_render_bytes(
                     width, height, spec.dpi, spec.color_mode, spec.max_pixels
@@ -397,7 +442,7 @@ class JobManager:
                 if not granted:
                     return
                 try:
-                    future = pool.submit(render_page, spec, next_page)
+                    future = pool.submit(render_page, spec, page_index)
                 except BaseException:
                     self._budget.release(granted)
                     raise
@@ -407,7 +452,7 @@ class JobManager:
 
         try:
             fill()
-            while pending or next_page < job.total_pages:
+            while pending or next_page < len(work):
                 if job.cancel_requested:
                     raise JobCancelled()
                 if not pending:

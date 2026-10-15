@@ -43,6 +43,9 @@ MAX_CONCURRENT_JOBS = max(1, _int("MAX_CONCURRENT_JOBS", 1))
 # Files the UI lets you queue in one go.
 MAX_BATCH_FILES = max(1, _int("MAX_BATCH_FILES", 5))
 
+# PDFs a single "convert this folder" job may contain.
+MAX_FOLDER_FILES = max(1, _int("MAX_FOLDER_FILES", 1000))
+
 DEFAULT_DPI = _int("DEFAULT_DPI", 200)
 MIN_DPI = 72
 MAX_DPI = _int("MAX_DPI", 600)
