@@ -8,6 +8,7 @@ the whole transfer again.
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import threading
@@ -65,6 +66,10 @@ class UploadStore:
                 f"File is larger than the {config.MAX_UPLOAD_MB} MB limit."
             )
 
+        free = shutil.disk_usage(config.UPLOADS_DIR).free
+        if free < size + config.MIN_FREE_DISK_MB * 1024 * 1024:
+            raise UploadError("The server is running out of disk space.")
+
         upload_id = uuid.uuid4().hex[:16]
         directory = config.UPLOADS_DIR / upload_id
         directory.mkdir(parents=True, exist_ok=True)
@@ -72,6 +77,9 @@ class UploadStore:
             id=upload_id, filename=filename, size=size, options=options, dir=directory
         )
         upload.path.touch()
+        (directory / "meta.json").write_text(
+            json.dumps({"filename": filename, "size": size, "options": options})
+        )
         with self._lock:
             self._uploads[upload_id] = upload
         log.info("upload %s started: %s (%.1f MB)", upload_id, filename, size / 1048576)
@@ -97,8 +105,11 @@ class UploadStore:
             if upload.received + len(chunk) > upload.size:
                 raise UploadError("Chunk overruns the declared file size.")
 
-            with open(upload.path, "ab") as handle:
+            # Seek and truncate so a half-written earlier attempt cannot corrupt the file.
+            with open(upload.path, "r+b") as handle:
+                handle.seek(upload.received)
                 handle.write(chunk)
+                handle.truncate()
             upload.received += len(chunk)
             upload.touched_at = time.time()
         return upload
@@ -118,11 +129,37 @@ class UploadStore:
         if upload is not None:
             shutil.rmtree(upload.dir, ignore_errors=True)
 
+    def restore(self) -> int:
+        """Re-attach unfinished uploads so a server restart does not lose them."""
+        restored = 0
+        for path in config.UPLOADS_DIR.iterdir():
+            try:
+                meta = json.loads((path / "meta.json").read_text())
+                upload = Upload(
+                    id=path.name,
+                    filename=meta["filename"],
+                    size=meta["size"],
+                    options=meta["options"],
+                    dir=path,
+                    received=(path / "part").stat().st_size,
+                )
+            except (OSError, ValueError, KeyError):
+                continue
+            with self._lock:
+                self._uploads[upload.id] = upload
+            restored += 1
+        return restored
+
     def cleanup(self) -> int:
         """Drop uploads that were abandoned part way through."""
-        cutoff = time.time() - config.UPLOAD_TTL_MINUTES * 60
+        now = time.time()
+        cutoff = now - config.UPLOAD_TTL_MINUTES * 60
         with self._lock:
-            stale = [u for u in self._uploads.values() if u.touched_at < cutoff]
+            # A folder finishes its first files long before its last ones, so
+            # while anything is still arriving only drop really old uploads.
+            busy = any(u.touched_at >= cutoff for u in self._uploads.values())
+            limit = now - 24 * 3600 if busy else cutoff
+            stale = [u for u in self._uploads.values() if u.touched_at < limit]
             for upload in stale:
                 self._uploads.pop(upload.id, None)
             known = set(self._uploads)

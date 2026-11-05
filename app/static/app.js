@@ -28,7 +28,7 @@ const el = {
   dtPages: $('dtPages'), dtRate: $('dtRate'), dtElapsed: $('dtElapsed'),
   dtEta: $('dtEta'), dtSize: $('dtSize'), retryUpload: $('retryUpload'),
   resultTitle: $('resultTitle'), resultSummary: $('resultSummary'),
-  download: $('download'), autoNote: $('autoNote'), again: $('again'),
+  download: $('download'), autoNote: $('autoNote'), warnNote: $('warnNote'), again: $('again'),
   dropServer: $('dropServer'), failMessage: $('failMessage'), retry: $('retry'),
 
   panelLibrary: $('panelLibrary'), library: $('library'), refreshJobs: $('refreshJobs'),
@@ -43,7 +43,7 @@ const state = {
   file: null,      // the one currently uploading
   batch: [],       // job ids from the last Convert, converted in order
   folder: null,    // { name, files } when a whole folder was picked
-  folderUploads: [],
+  folderUploads: {},
   maxFolderFiles: 1000,
   maxFiles: 5,
   jobId: null,
@@ -56,10 +56,10 @@ const state = {
   // Upload bookkeeping. `uploading` also stops the library poll from
   // resetting the view out from under an upload in flight.
   uploading: false,
-  xhr: null,
+  transfers: new Set(),   // one per file going up, for stall checks and cancel
   uploadStart: 0,
-  lastProgressAt: 0,
   stallTimer: null,
+  pollFails: 0,
   uploadId: null,
   cancelled: false,
   baseBytes: 0,
@@ -93,7 +93,7 @@ async function api(path, options = {}) {
   if (!res.ok) {
     let detail = `Request failed (${res.status})`;
     try { detail = (await res.json()).detail || detail; } catch (_) { /* keep default */ }
-    throw new Error(detail);
+    throw Object.assign(new Error(detail), { status: res.status });
   }
   return res.status === 204 ? null : res.json();
 }
@@ -270,7 +270,7 @@ function pickError(message) {
 function clearFiles() {
   state.files = [];
   state.folder = null;
-  state.folderUploads = [];
+  state.folderUploads = {};
   el.folder.value = '';
   state.file = null;
   el.file.value = '';
@@ -389,12 +389,32 @@ async function startUpload() {
   }
 }
 
-/* A folder: every PDF goes up first, then the server turns the lot into one
-   job whose ZIP holds a TIFF per sheet. A retry skips files already sent. */
+/* A folder: PDFs go up a few at a time, then the server turns the lot into one
+   job whose ZIP holds a TIFF per sheet. Sent files are remembered, so "Try
+   again" - or picking the same folder after a reload - skips what already landed. */
+const FOLDER_PARALLEL = 4;
+const FOLDER_KEY = 'pagesmith.folder';
+
+const folderFileKey = (file) => `${file.webkitRelativePath || file.name}|${file.size}`;
+
+function loadFolderIds(name) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FOLDER_KEY) || 'null');
+    return saved && saved.name === name ? saved.ids : {};
+  } catch (_) { return {}; }
+}
+
+function saveFolderIds(name, ids) {
+  try { localStorage.setItem(FOLDER_KEY, JSON.stringify({ name, ids })); } catch (_) { /* no resume */ }
+}
+
+function forgetFolderIds() {
+  try { localStorage.removeItem(FOLDER_KEY); } catch (_) { /* ignore */ }
+}
+
 async function startFolderUpload() {
   if (state.uploading) return;
   const { name, files } = state.folder;
-  if (!state.retrying) state.folderUploads = [];
   state.retrying = false;
   state.batch = [];
 
@@ -403,24 +423,63 @@ async function startFolderUpload() {
   el.retryUpload.hidden = true;
   state.uploading = true;
   state.cancelled = false;
+  state.uploadStart = Date.now();
+  state.baseBytes = 0;
+  state.file = null;
+  resetRunView(`${name} · 0 of ${files.length} PDFs sent`);
   startStallWatch();
 
-  try {
-    for (let i = state.folderUploads.length; i < files.length; i += 1) {
+  const ids = loadFolderIds(name);
+  state.folderUploads = ids;
+  const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+  const loaded = new Array(files.length).fill(0);
+  const uploadIds = new Array(files.length).fill(null);
+  let next = 0;
+  let sent = 0;
+  let halted = false;
+
+  async function worker() {
+    while (next < files.length && !halted && !state.cancelled) {
+      const i = next;
+      next += 1;
       const file = files[i];
-      state.file = file;
-      resetRunView(`${name} · PDF ${i + 1} of ${files.length} · ${file.name}`);
-      state.folderUploads.push(await uploadOne(file, false));
+      const key = folderFileKey(file);
+      const transfer = newTransfer((bytes) => {
+        loaded[i] = bytes;
+        paintUpload(loaded.reduce((sum, n) => sum + n, 0), totalBytes);
+      });
+      try {
+        uploadIds[i] = await sendFile(file, transfer, ids[key], (session, offset) => {
+          ids[key] = session.upload_id;
+          state.baseBytes += offset;
+          saveFolderIds(name, ids);
+        });
+        sent += 1;
+        el.fileLabel.textContent = `${name} · ${sent} of ${files.length} PDFs sent`;
+      } catch (err) {
+        halted = true;
+        throw err;
+      }
     }
+  }
+
+  try {
+    const runs = await Promise.allSettled(
+      Array.from({ length: Math.min(FOLDER_PARALLEL, files.length) }, worker),
+    );
+    const failed = runs.find((run) => run.status === 'rejected');
+    if (failed) throw failed.reason;
+    if (state.cancelled) throw Object.assign(new Error('cancelled'), { aborted: true });
+
     paintHandoff();
-    const created = await api('/api/folder-jobs', {
+    const created = await withRetry(() => api('/api/folder-jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, upload_ids: state.folderUploads }),
-    });
-    state.folderUploads = [];
+      body: JSON.stringify({ name, upload_ids: uploadIds }),
+    }));
+    forgetFolderIds();
+    state.folderUploads = {};
     state.folder = null;
-    state.file = null;
     finishUpload();
     renderChosen();
     watch(created.job_id);
@@ -429,7 +488,6 @@ async function startFolderUpload() {
     finishUpload();
     if (err.auth || err.message === 'unauthenticated') return;
     if (err.aborted || state.cancelled) {
-      await discardUpload();
       await discardFolderUploads();
       backToIdle();
       return;
@@ -440,36 +498,66 @@ async function startFolderUpload() {
 }
 
 async function discardFolderUploads() {
-  const ids = state.folderUploads;
-  state.folderUploads = [];
+  const ids = Object.values(state.folderUploads || {});
+  state.folderUploads = {};
+  forgetFolderIds();
   await Promise.all(ids.map((id) =>
     api(`/api/uploads/${id}`, { method: 'DELETE' }).catch(() => {})));
 }
 
-async function uploadOne(file, finish = true) {
-  state.uploadStart = Date.now();
-  state.lastProgressAt = Date.now();
-  state.baseBytes = 0;
-  {
-    let session = null;
-    let offset = 0;
+/* Retries what a dropped connection or a restarting server can break. The
+   finish endpoints are idempotent, so a repeat cannot create a second job. */
+async function withRetry(call, tries = 6) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await call();
+    } catch (err) {
+      const permanent = err.message === 'unauthenticated'
+        || (err.status && err.status < 500 && err.status !== 429);
+      if (permanent || attempt >= tries || state.cancelled) throw err;
+      el.stageLabel.textContent = `Connection problem — retrying (${attempt}/${tries - 1})`;
+      await sleep(Math.min(8000, 500 * 2 ** attempt));
+    }
+  }
+}
 
-    // Same file as an interrupted transfer? Continue from the server's offset.
-    const previous = rememberedUpload();
-    if (previous) {
+function newTransfer(onProgress) {
+  const transfer = { xhr: null, lastProgressAt: Date.now(), onProgress };
+  state.transfers.add(transfer);
+  return transfer;
+}
+
+async function uploadOne(file) {
+  state.uploadStart = Date.now();
+  state.baseBytes = 0;
+  const previous = rememberedUpload();
+  const transfer = newTransfer((bytes) => paintUpload(bytes, file.size));
+  const id = await sendFile(file, transfer, previous && previous.id, (session, offset) => {
+    state.uploadId = session.upload_id;
+    state.baseBytes = offset;
+    rememberUpload(state.uploadId);
+  });
+  paintHandoff();
+  const created = await withRetry(() => api(`/api/uploads/${id}/finish`, { method: 'POST' }));
+  forgetUpload();
+  state.uploadId = null;
+  return created.job_id;
+}
+
+/* Sends one file in chunks, resuming `resumeId` if the server still holds it. */
+async function sendFile(file, transfer, resumeId, onSession) {
+  try {
+    let session = null;
+    if (resumeId) {
       try {
-        session = await api(`/api/uploads/${previous.id}`);
-        offset = session.received || 0;
-        if (offset > 0) {
-          el.stageLabel.textContent = `Resuming from ${humanBytes(offset)}`;
-        }
-      } catch (_) {
+        session = await api(`/api/uploads/${resumeId}`);
+      } catch (err) {
+        if (err.message === 'unauthenticated') throw err;
         session = null;                       // expired; start a fresh one
       }
     }
-
     if (!session) {
-      session = await api('/api/uploads', {
+      session = await withRetry(() => api('/api/uploads', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -481,15 +569,14 @@ async function uploadOne(file, finish = true) {
           zip_compress: el.zipCompress.checked,
           auto_delete: el.autoDelete.checked,
         }),
-      });
-      offset = session.received || 0;
+      }));
     }
 
-    state.uploadId = session.upload_id;
-    state.baseBytes = offset;
-    rememberUpload(state.uploadId);
+    const uploadId = session.upload_id;
+    let offset = session.received || 0;
+    onSession(session, offset);
     const chunkSize = session.chunk_size || DEFAULT_CHUNK;
-    paintUpload(offset, file.size);
+    transfer.onProgress(offset);
 
     while (offset < file.size) {
       if (state.cancelled) throw Object.assign(new Error('cancelled'), { aborted: true });
@@ -498,7 +585,7 @@ async function uploadOne(file, finish = true) {
       for (;;) {
         const end = Math.min(offset + chunkSize, file.size);
         try {
-          offset = await sendChunk(state.uploadId, file.slice(offset, end), offset, file.size);
+          offset = await sendChunk(transfer, uploadId, file.slice(offset, end), offset);
           break;
         } catch (err) {
           if (err.fatal) throw err;
@@ -509,44 +596,35 @@ async function uploadOne(file, finish = true) {
           await sleep(Math.min(8000, 400 * 2 ** attempt));
           if (state.cancelled) throw Object.assign(new Error('cancelled'), { aborted: true });
           // The chunk may have landed before the link died - resync and go on.
-          try { offset = (await api(`/api/uploads/${state.uploadId}`)).received; }
+          try { offset = (await api(`/api/uploads/${uploadId}`)).received; }
           catch (_) { /* keep the offset we have and retry it */ }
           if (offset >= file.size) break;
         }
       }
-      paintUpload(offset, file.size);
+      transfer.onProgress(offset);
     }
-
-    if (!finish) {
-      const id = state.uploadId;
-      forgetUpload();
-      state.uploadId = null;
-      return id;
-    }
-    paintHandoff();
-    const created = await api(`/api/uploads/${state.uploadId}/finish`, { method: 'POST' });
-    forgetUpload();
-    state.uploadId = null;
-    return created.job_id;
+    return uploadId;
+  } finally {
+    state.transfers.delete(transfer);
   }
 }
 
-function sendChunk(uploadId, blob, offset, total) {
+function sendChunk(transfer, uploadId, blob, offset) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    state.xhr = xhr;
+    transfer.xhr = xhr;
     xhr.open('PATCH', `/api/uploads/${uploadId}`);
     xhr.setRequestHeader('X-Offset', String(offset));
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
     xhr.upload.onprogress = (event) => {
-      state.lastProgressAt = Date.now();
-      if (event.lengthComputable) paintUpload(offset + event.loaded, total);
+      transfer.lastProgressAt = Date.now();
+      if (event.lengthComputable) transfer.onProgress(offset + event.loaded);
     };
 
     xhr.onload = () => {
-      state.xhr = null;
-      state.lastProgressAt = Date.now();
+      transfer.xhr = null;
+      transfer.lastProgressAt = Date.now();
       let data = {};
       try { data = JSON.parse(xhr.responseText); } catch (_) { /* below */ }
 
@@ -568,10 +646,10 @@ function sendChunk(uploadId, blob, offset, total) {
       reject(new Error(detailText(data, `HTTP ${xhr.status}`)));
     };
 
-    xhr.onerror = () => { state.xhr = null; reject(new Error('network')); };
-    xhr.ontimeout = () => { state.xhr = null; reject(new Error('timeout')); };
+    xhr.onerror = () => { transfer.xhr = null; reject(new Error('network')); };
+    xhr.ontimeout = () => { transfer.xhr = null; reject(new Error('timeout')); };
     xhr.onabort = () => {
-      state.xhr = null;
+      transfer.xhr = null;
       // A stall abort should retry the chunk; a user cancel should not.
       if (state.cancelled) {
         reject(Object.assign(new Error('cancelled'), { aborted: true, fatal: true }));
@@ -607,7 +685,7 @@ function uploadMessage(err) {
 
 function finishUpload() {
   state.uploading = false;
-  state.xhr = null;
+  state.transfers.clear();
   el.start.disabled = !state.files.length && !state.folder;
   clearInterval(state.stallTimer);
   state.stallTimer = null;
@@ -617,8 +695,11 @@ function startStallWatch() {
   clearInterval(state.stallTimer);
   state.stallTimer = setInterval(() => {
     if (!state.uploading) return;
-    if (Date.now() - state.lastProgressAt > STALL_AFTER_MS && state.xhr) {
-      state.xhr.abort();        // retried by the chunk loop, not fatal
+    for (const transfer of state.transfers) {
+      if (transfer.xhr && Date.now() - transfer.lastProgressAt > STALL_AFTER_MS) {
+        transfer.lastProgressAt = Date.now();
+        transfer.xhr.abort();   // retried by the chunk loop, not fatal
+      }
     }
   }, 5000);
 }
@@ -626,7 +707,7 @@ function startStallWatch() {
 function showUploadFailure(message, offerRetry) {
   el.failMessage.textContent = message;
   el.retryUpload.hidden = !offerRetry || (!state.files.length && !state.folder);
-  el.retryUpload.textContent = state.uploadId ? 'Resume upload' : 'Try again';
+  el.retryUpload.textContent = state.uploadId || state.folder ? 'Resume upload' : 'Try again';
   liveView('fail');
 }
 
@@ -692,11 +773,17 @@ function watch(id) {
 
 async function pollOnce(id) {
   try {
-    paint(await api(`/api/status/${id}`));
+    const status = await api(`/api/status/${id}`);
+    state.pollFails = 0;
+    paint(status);
   } catch (err) {
     if (err.message === 'unauthenticated') return;
-    stopWatching();
-    showFailure('Lost contact with the server.');
+    // A restarting server or tunnel hiccup is not a failed job; give it time.
+    state.pollFails += 1;
+    if (err.status === 404 || state.pollFails > 100) {
+      stopWatching();
+      showFailure('Lost contact with the server.');
+    }
   }
 }
 
@@ -730,6 +817,17 @@ function nextInBatch(afterId) {
 function batchLabel(id) {
   const at = state.batch.indexOf(id);
   return state.batch.length > 1 && at >= 0 ? `PDF ${at + 1} of ${state.batch.length} · ` : '';
+}
+
+function jobWarnings(job) {
+  const out = [];
+  if (job.failed_count) {
+    out.push(`${job.failed_count} page(s) or file(s) could not be converted — see FAILED_PAGES.txt in the ZIP.`);
+  }
+  if (job.scaled_pages) {
+    out.push(`${job.scaled_pages} page(s) were too large and came out at ${job.scaled_dpi} dpi instead of ${job.dpi}.`);
+  }
+  return out;
 }
 
 function paint(s) {
@@ -768,7 +866,10 @@ function paint(s) {
     el.download.setAttribute('download', s.zip_name);
     el.resultTitle.textContent = state.batch.length > 1
       ? `All ${state.batch.length} PDFs processed — download each one below`
-      : `${s.total_pages} TIFF${s.total_pages === 1 ? '' : 's'} ready`;
+      : `${s.done_pages} TIFF${s.done_pages === 1 ? '' : 's'} ready`;
+    const warnings = jobWarnings(s);
+    el.warnNote.textContent = warnings.join(' ');
+    el.warnNote.hidden = !warnings.length;
     el.resultSummary.textContent =
       `${s.zip_name} · ${humanBytes(s.zip_size)} · ${s.dpi} dpi · ${humanTime(s.elapsed)}`;
     el.autoNote.hidden = !s.auto_delete;
@@ -798,7 +899,7 @@ el.cancel.addEventListener('click', async () => {
   el.cancel.textContent = 'Cancelling…';
   if (state.uploading) {
     state.cancelled = true;
-    if (state.xhr) state.xhr.abort();
+    for (const transfer of state.transfers) if (transfer.xhr) transfer.xhr.abort();
     return;
   }
   if (state.jobId) {
@@ -889,9 +990,17 @@ function renderLibraryRow(job) {
   const name = document.createElement('b');
   name.textContent = job.original_name;
   const sub = document.createElement('small');
-  sub.textContent = job.active
-    ? `${job.stage_label} · ${job.done_pages}/${job.total_pages || '?'} pages`
-    : `${job.total_pages} pages · ${humanBytes(job.zip_size)} · expires in ${humanTime(job.expires_in)}`;
+  if (job.active) {
+    sub.textContent = `${job.stage_label} · ${job.done_pages}/${job.total_pages || '?'} pages`;
+  } else if (job.stage === 'done') {
+    sub.textContent = [
+      `${job.done_pages} pages`, humanBytes(job.zip_size), `expires in ${humanTime(job.expires_in)}`,
+      ...(job.failed_count ? [`${job.failed_count} failed`] : []),
+      ...(job.scaled_pages ? [`${job.scaled_pages} at ${job.scaled_dpi} dpi`] : []),
+    ].join(' · ');
+  } else {
+    sub.textContent = job.error || job.stage_label;
+  }
   meta.append(name, sub);
 
   const acts = document.createElement('span');

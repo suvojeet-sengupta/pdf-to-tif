@@ -52,7 +52,10 @@ async def lifespan(_: FastAPI):
     manager.start()
     restored = manager.restore()
     if restored:
-        log.info("restored %d finished archive(s) from disk", restored)
+        log.info("restored %d job(s) from disk", restored)
+    resumed = uploads.store.restore()
+    if resumed:
+        log.info("restored %d unfinished upload(s)", resumed)
 
     cleaner = asyncio.create_task(_cleanup_loop())
     try:
@@ -263,7 +266,7 @@ async def upload_chunk(upload_id: str, request: Request) -> dict:
         raise HTTPException(status_code=413, detail="Chunk is too large.")
 
     try:
-        upload = uploads.store.append(upload_id, offset, chunk)
+        upload = await asyncio.to_thread(uploads.store.append, upload_id, offset, chunk)
     except uploads.UploadError as exc:
         # 409 carries the server's real offset so the client can resync.
         status = 404 if "expired" in str(exc) else 409
@@ -279,7 +282,11 @@ async def upload_chunk(upload_id: str, request: Request) -> dict:
 
 @app.post("/api/uploads/{upload_id}/finish", dependencies=[Guarded])
 async def upload_finish(upload_id: str) -> JSONResponse:
-    """Turn a completed upload into a conversion job."""
+    """Turn a completed upload into a conversion job. Safe to call twice: a
+    retry after a dropped response gets the job the first call created."""
+    existing = manager.find_by_token(upload_id)
+    if existing is not None:
+        return JSONResponse({"job_id": existing.id, "status_url": f"/api/events/{existing.id}"})
     try:
         upload = uploads.store.finish(upload_id)
     except uploads.UploadError as exc:
@@ -292,12 +299,13 @@ async def upload_finish(upload_id: str) -> JSONResponse:
         compression=upload.options["compression"],
         zip_compress=upload.options["zip_compress"],
         auto_delete=upload.options["auto_delete"],
+        token=upload_id,
     )
     try:
         # Same filesystem, so this is a rename rather than a second copy.
         os.replace(upload.path, job.pdf_path)
     except OSError as exc:
-        shutil.rmtree(job.dir, ignore_errors=True)
+        manager.delete(job.id)
         raise HTTPException(status_code=500, detail=f"Could not store the upload: {exc}") from exc
     finally:
         uploads.store.discard(upload_id)
@@ -321,6 +329,10 @@ async def folder_finish(body: FolderFinish) -> JSONResponse:
             status_code=400,
             detail=f"A folder can hold at most {config.MAX_FOLDER_FILES} PDFs.",
         )
+    token = f"folder:{body.upload_ids[0]}"
+    existing = manager.find_by_token(token)
+    if existing is not None:
+        return JSONResponse({"job_id": existing.id, "status_url": f"/api/events/{existing.id}"})
     try:
         parts = [uploads.store.finish(upload_id) for upload_id in body.upload_ids]
     except uploads.UploadError as exc:
@@ -334,6 +346,7 @@ async def folder_finish(body: FolderFinish) -> JSONResponse:
         compression=options["compression"],
         zip_compress=options["zip_compress"],
         auto_delete=options["auto_delete"],
+        token=token,
     )
     source_dir = job.dir / "sources"
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +357,7 @@ async def folder_finish(body: FolderFinish) -> JSONResponse:
             os.replace(part.path, target)
             sources.append((part.filename, target))
     except OSError as exc:
-        shutil.rmtree(job.dir, ignore_errors=True)
+        manager.delete(job.id)
         raise HTTPException(status_code=500, detail=f"Could not store the upload: {exc}") from exc
     finally:
         for upload_id in body.upload_ids:

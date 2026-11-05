@@ -168,6 +168,7 @@ All settings are environment variables — set them in `docker-compose.yml`.
 | `RENDER_WORKERS` | `min(8, cores)` | Worker processes rendering pages in parallel |
 | `MAX_CONCURRENT_JOBS` | `1` | How many PDFs may convert at the same time (1 = a batch converts one by one) |
 | `MAX_BATCH_FILES` | `5` | PDFs the UI lets you pick and queue in one go |
+| `PAGE_STALL_SECONDS` | `900` | Kill and retry the renderer when no page finishes for this long |
 | `RENDER_MEMORY_MB` | 80% of the container limit | Estimated memory all page renders may hold at once; large sheets are dispatched only while they fit |
 | `MAX_UPLOAD_MB` | `500` | Rejected above this size |
 | `MAX_PAGES` | `10000` | Page-count ceiling per PDF |

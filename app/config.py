@@ -102,6 +102,9 @@ DISK_CHECK_EVERY = _int("DISK_CHECK_EVERY", 25)
 # instead of exhausting the worker's memory (a 600 dpi A0 sheet is ~1.4 GB).
 MAX_PAGE_PIXELS = _int("MAX_PAGE_PIXELS", 120_000_000)
 
+# No page finishing for this long means a worker hung; it is killed and retried.
+PAGE_STALL_SECONDS = _int("PAGE_STALL_SECONDS", 900)
+
 
 def _container_memory_limit() -> int:
     for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
@@ -126,7 +129,7 @@ RENDER_MEMORY_BYTES = _int(
 # Chunked uploads
 # ---------------------------------------------------------------------------
 UPLOADS_DIR = DATA_DIR / "uploads"
-UPLOAD_CHUNK_BYTES = _int("UPLOAD_CHUNK_MB", 4) * 1024 * 1024
+UPLOAD_CHUNK_BYTES = _int("UPLOAD_CHUNK_MB", 8) * 1024 * 1024
 # An unfinished upload is discarded after this long without activity.
 UPLOAD_TTL_MINUTES = _int("UPLOAD_TTL_MINUTES", 180)
 
