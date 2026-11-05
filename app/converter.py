@@ -90,9 +90,9 @@ def effective_zoom(width_pt: float, height_pt: float, dpi: int, max_pixels: int)
     return zoom
 
 
-# Peak worker RSS measured on 24x36in banners: ~14 B/px colour, ~9 B/px grey.
+# Peak worker RSS measured on 48x72in banners: ~6.4 B/px colour, ~1.9 B/px grey.
 _WORKER_BASE_BYTES = 100 * 1024 * 1024
-_BYTES_PER_PIXEL = {"color": 15, "gray": 9, "bw": 9}
+_BYTES_PER_PIXEL = {"color": 9, "gray": 4, "bw": 4}
 
 
 def estimate_render_bytes(
