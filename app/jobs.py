@@ -430,14 +430,17 @@ class JobManager:
         work: list[tuple[RenderSpec, int, str]] = []
         used: set[str] = set()
         for (name, path), count in zip(job.sources, job.page_counts):
-            prefix = _safe_stem(name) if folder_job else stem
+            folders, leaf = _split_source_name(name) if folder_job else ([], name)
+            target = out_dir.joinpath(*folders)
+            target.mkdir(parents=True, exist_ok=True)
+            prefix = _safe_stem(leaf) if folder_job else stem
             base, n = prefix, 2
-            while prefix.lower() in used:
+            while f"{target}/{prefix}".lower() in used:
                 prefix, n = f"{base}_{n}", n + 1
-            used.add(prefix.lower())
+            used.add(f"{target}/{prefix}".lower())
             spec = RenderSpec(
                 pdf_path=str(path),
-                out_dir=str(out_dir),
+                out_dir=str(target),
                 prefix=prefix,
                 dpi=job.dpi,
                 color_mode=job.color_mode,
@@ -454,9 +457,8 @@ class JobManager:
         step = max(1, min(50, job.total_pages // 20 or 1))
 
         with zipfile.ZipFile(zip_path, "w", compression=mode, allowZip64=True) as archive:
-            for filename, written in self._render_stream(job, work):
-                page_file = out_dir / filename
-                archive.write(page_file, arcname=filename)
+            for page_file, written in self._render_stream(job, work):
+                archive.write(page_file, arcname=page_file.relative_to(out_dir).as_posix())
                 page_file.unlink(missing_ok=True)
 
                 done, total_bytes = job.bump_page(written)
@@ -481,7 +483,7 @@ class JobManager:
         return zip_path
 
     def _render_stream(self, job: Job, work: list[tuple[RenderSpec, int, str]]):
-        """Yield (filename, bytes) per page, keeping only a few pages in flight.
+        """Yield (TIFF path, bytes) per page, keeping only a few pages in flight.
 
         Pages are dispatched while their estimated memory fits the shared
         budget. A worker crash never restarts the job: finished pages stay in
@@ -613,7 +615,7 @@ class JobManager:
                     alone.discard(index)
                     failures_in_a_row = 0
                     last_progress = time.monotonic()
-                    yield filename, written
+                    yield Path(work[index][0].out_dir) / filename, written
                 fill()
         finally:
             for future in pending:
@@ -773,6 +775,23 @@ def _safe_stem(name: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in "-_ " else "_" for ch in stem)
     cleaned = "_".join(cleaned.split())
     return cleaned[:60] or "document"
+
+
+def _split_source_name(name: str) -> tuple[list[str], str]:
+    """Split a browser-supplied relative path into safe folder names and the file.
+
+    The path comes from the client, so "..", absolute paths and odd characters
+    must never reach the filesystem or the archive.
+    """
+    parts = [p for p in name.replace("\\", "/").split("/") if p.strip() not in ("", ".", "..")]
+    if not parts:
+        return [], "document.pdf"
+    return [_safe_folder(p) for p in parts[:-1]], parts[-1]
+
+
+def _safe_folder(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_ ()" else "_" for ch in name)
+    return " ".join(cleaned.split())[:80].strip() or "folder"
 
 
 def _human(num: float) -> str:

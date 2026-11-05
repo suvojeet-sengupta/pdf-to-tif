@@ -213,7 +213,11 @@ function renderFolderRow() {
   label.textContent = name;
   const size = document.createElement('small');
   const bytes = files.reduce((sum, f) => sum + f.size, 0);
-  size.textContent = `${files.length} PDF${files.length === 1 ? '' : 's'} · ${humanBytes(bytes)} · each sheet → its own TIFF`;
+  const subfolders = new Set(files
+    .map((f) => folderRelativePath(f).split('/').slice(0, -1).join('/'))
+    .filter(Boolean)).size;
+  const layout = subfolders ? `${subfolders} subfolder${subfolders === 1 ? '' : 's'} kept in the ZIP` : 'each sheet → its own TIFF';
+  size.textContent = `${files.length} PDF${files.length === 1 ? '' : 's'} · ${humanBytes(bytes)} · ${layout}`;
   meta.append(label, size);
   const remove = button('✕', 'btn btn--icon', () => {
     if (state.uploading) return;
@@ -395,6 +399,10 @@ async function startUpload() {
 const FOLDER_PARALLEL = 4;
 const FOLDER_KEY = 'pagesmith.folder';
 
+// Path below the picked folder; the ZIP recreates these subfolders.
+const folderRelativePath = (file) =>
+  (file.webkitRelativePath || '').split('/').slice(1).join('/') || file.name;
+
 const folderFileKey = (file) => `${file.webkitRelativePath || file.name}|${file.size}`;
 
 function loadFolderIds(name) {
@@ -453,7 +461,7 @@ async function startFolderUpload() {
           ids[key] = session.upload_id;
           state.baseBytes += offset;
           saveFolderIds(name, ids);
-        });
+        }, folderRelativePath(file));
         sent += 1;
         el.fileLabel.textContent = `${name} · ${sent} of ${files.length} PDFs sent`;
       } catch (err) {
@@ -545,7 +553,7 @@ async function uploadOne(file) {
 }
 
 /* Sends one file in chunks, resuming `resumeId` if the server still holds it. */
-async function sendFile(file, transfer, resumeId, onSession) {
+async function sendFile(file, transfer, resumeId, onSession, uploadName = file.name) {
   try {
     let session = null;
     if (resumeId) {
@@ -561,7 +569,7 @@ async function sendFile(file, transfer, resumeId, onSession) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          filename: file.name,
+          filename: uploadName,
           size: file.size,
           dpi: Number(el.dpi.value),
           color_mode: el.color.value,

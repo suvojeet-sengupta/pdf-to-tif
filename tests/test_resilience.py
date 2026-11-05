@@ -117,6 +117,42 @@ def main():
     print("ok: hung page killed and reported")
 
     manager._renderer = render_page
+    job = manager.create("Sheets", 72, "color", "lzw", False)
+    source_dir = job.dir / "sources"
+    source_dir.mkdir()
+    sources = []
+    for i, (name, pages) in enumerate([
+        ("top.pdf", 1),
+        ("Area A/sheet.pdf", 1),
+        ("Area B/sheet.pdf", 2),
+        ("Area B/Deep/sheet.pdf", 1),
+        ("Area A/sheet.PDF", 1),
+        ("../../../evil/../pwn.pdf", 1),
+        ("/etc/abs.pdf", 1),
+        ("..\\..\\win.pdf", 1),
+    ]):
+        path = source_dir / f"{i:05d}.pdf"
+        make_pdf(path, pages)
+        sources.append((name, path))
+    job.sources = sources
+    manager._run(job)
+    assert job.stage == "done", job.snapshot()
+    with zipfile.ZipFile(job.dir / job.zip_name) as archive:
+        names = sorted(archive.namelist())
+    assert names == sorted([
+        "top.tif",
+        "Area A/sheet.tif",
+        "Area A/sheet_2.tif",
+        "Area B/sheet_page_001.tif",
+        "Area B/sheet_page_002.tif",
+        "Area B/Deep/sheet.tif",
+        "evil/pwn.tif",
+        "etc/abs.tif",
+        "win.tif",
+    ]), names
+    assert not any(".." in n or n.startswith("/") for n in names)
+    print("ok: subfolders kept in the ZIP, unsafe paths neutralised")
+
     running = manager.create("long.pdf", 72, "color", "lzw", False)
     running.created_at -= 10 * 86400
     running.update(stage="rendering")
