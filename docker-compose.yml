@@ -24,7 +24,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8g
+          memory: 13g
 
 volumes:
   pdf2tif-data:
