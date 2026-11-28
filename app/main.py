@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import ClientDisconnect
 
 from . import auth, config, uploads
+from .drive import DriveError, safe_folder, uploader
 from .converter import normalise_options
 from .jobs import manager
 
@@ -50,9 +51,11 @@ async def lifespan(_: FastAPI):
         log.warning("running without a password - ALLOW_NO_PASSWORD is enabled")
 
     manager.start()
+    manager.pinned = uploader.pinned_jobs
     restored = manager.restore()
     if restored:
         log.info("restored %d job(s) from disk", restored)
+    uploader.restore()
     resumed = uploads.store.restore()
     if resumed:
         log.info("restored %d unfinished upload(s)", resumed)
@@ -65,6 +68,7 @@ async def lifespan(_: FastAPI):
         with contextlib.suppress(asyncio.CancelledError):
             await cleaner
         manager.shutdown()
+        uploader.shutdown()
 
 
 async def _cleanup_loop() -> None:
@@ -399,6 +403,8 @@ async def cancel(job_id: str) -> dict:
 
 @app.delete("/api/jobs/{job_id}", dependencies=[Guarded])
 async def delete_job(job_id: str) -> dict:
+    if job_id in uploader.pinned_jobs():
+        raise HTTPException(status_code=409, detail="This archive is being uploaded to Google Drive.")
     if not manager.delete(job_id):
         raise HTTPException(status_code=404, detail="Unknown or expired job.")
     return {"deleted": True}
@@ -456,6 +462,60 @@ async def download(job_id: str) -> FileResponse:
         headers={"Cache-Control": "no-store"},
         background=cleanup,
     )
+
+
+class DriveStart(BaseModel):
+    job_ids: list[str] = Field(min_length=1, max_length=200)
+    folder: str = Field(default="", max_length=200)
+
+
+@app.get("/api/drive", dependencies=[Guarded])
+async def drive_list() -> dict:
+    return {"uploads": uploader.list()}
+
+
+@app.post("/api/drive", dependencies=[Guarded])
+async def drive_start(body: DriveStart) -> dict:
+    """One archive goes into a folder of its own name; several go into one
+    folder, each in a subfolder."""
+    jobs = []
+    for job_id in dict.fromkeys(body.job_ids):
+        job = manager.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="One of the selected archives has expired.")
+        if job.stage != "done" or not (job.dir / job.zip_name).is_file():
+            raise HTTPException(status_code=409, detail=f"{job.original_name} is not ready to upload.")
+        jobs.append(job)
+
+    if len(jobs) == 1:
+        folder = safe_folder(body.folder) or safe_folder(Path(jobs[0].zip_name).stem) or "archive"
+    else:
+        folder = safe_folder(body.folder)
+        if not folder:
+            raise HTTPException(status_code=400, detail="Give the Drive folder a name.")
+
+    try:
+        await asyncio.to_thread(uploader.check_setup)
+    except DriveError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    upload = uploader.start(folder, jobs)
+    log.info("drive upload %s started (%s, %d archive(s))", upload.id, folder, len(jobs))
+    return upload.snapshot()
+
+
+@app.post("/api/drive/{upload_id}/cancel", dependencies=[Guarded])
+async def drive_cancel(upload_id: str) -> dict:
+    if not uploader.cancel(upload_id):
+        raise HTTPException(status_code=404, detail="This upload is not running.")
+    return {"cancelled": True}
+
+
+@app.delete("/api/drive/{upload_id}", dependencies=[Guarded])
+async def drive_remove(upload_id: str) -> dict:
+    if not uploader.remove(upload_id):
+        raise HTTPException(status_code=409, detail="Only a finished upload can be removed.")
+    return {"removed": True}
 
 
 @app.get("/healthz")

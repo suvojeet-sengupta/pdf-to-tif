@@ -134,3 +134,14 @@ UPLOAD_CHUNK_BYTES = _int("UPLOAD_CHUNK_MB", 8) * 1024 * 1024
 UPLOAD_TTL_MINUTES = _int("UPLOAD_TTL_MINUTES", 180)
 
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Google Drive upload (rclone)
+# ---------------------------------------------------------------------------
+DRIVE_DIR = DATA_DIR / "drive"
+# The rclone remote and the folder on it that uploads go into.
+GDRIVE_REMOTE = os.environ.get("GDRIVE_REMOTE", "gdrive").strip().rstrip(":") or "gdrive"
+GDRIVE_FOLDER = os.environ.get("GDRIVE_FOLDER", "Pagesmith").strip()
+# An upload that moves no bytes for this long is killed and started again.
+DRIVE_STALL_SECONDS = max(30, _int("DRIVE_STALL_SECONDS", 300))
+DRIVE_RETRIES = max(1, _int("DRIVE_RETRIES", 3))

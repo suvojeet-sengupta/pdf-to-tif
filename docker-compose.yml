@@ -14,8 +14,11 @@ services:
     environment:
       PORT: 9000
       DATA_DIR: /data
+      # A copy of the host rclone config, owned by the app user (uid 10001).
+      RCLONE_CONFIG: /config/rclone/rclone.conf
     volumes:
       - pdf2tif-data:/data
+      - ./rclone:/config/rclone
     tmpfs:
       # Small on purpose - uploads are spooled onto the data volume instead.
       - /tmp:size=64m

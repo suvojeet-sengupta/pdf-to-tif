@@ -214,6 +214,8 @@ class JobManager:
             max_workers=config.MAX_CONCURRENT_JOBS, thread_name_prefix="job"
         )
         self._stopping = False
+        # Ids of jobs whose archive is being read elsewhere; cleanup leaves them alone.
+        self.pinned = None
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -743,11 +745,12 @@ class JobManager:
     def cleanup(self) -> int:
         cutoff = time.time() - config.JOB_TTL_MINUTES * 60
         removed = 0
+        pinned = self.pinned() if self.pinned else set()
         with self._lock:
             stale = [
                 job
                 for job in self._jobs.values()
-                if job.terminal and (job.finished_at or job.created_at) < cutoff
+                if job.terminal and (job.finished_at or job.created_at) < cutoff and job.id not in pinned
             ]
             for job in stale:
                 self._jobs.pop(job.id, None)

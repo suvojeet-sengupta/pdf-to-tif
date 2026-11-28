@@ -215,7 +215,22 @@
         <h2>On this server</h2>
         <button type="button" class="btn btn--icon" id="refreshJobs" title="Refresh">⟳</button>
       </div>
+      <div class="drivebar" id="driveBar" hidden>
+        <input type="text" id="driveFolder" maxlength="120" placeholder="Drive folder name" aria-label="Drive folder name">
+        <button type="button" class="btn btn--solid" id="driveSelected">Upload to Drive</button>
+        <button type="button" class="btn btn--quiet" id="driveClear">Clear</button>
+      </div>
+      <p class="drive-error" id="driveError" role="alert" hidden></p>
       <ul class="library" id="library"></ul>
+    </section>
+
+    <!-- ── google drive ───────────────────────────────────────────────── -->
+    <section class="panel panel--library" id="panelDrive" hidden>
+      <div class="panel__head">
+        <span class="step">05</span>
+        <h2>Google Drive</h2>
+      </div>
+      <ul class="library" id="driveList"></ul>
     </section>
 
   </main>

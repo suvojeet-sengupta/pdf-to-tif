@@ -507,6 +507,21 @@ input::placeholder { color: var(--text-dim); }
 .lib__meta b { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lib__meta small { color: var(--text-dim); font: 500 11.5px var(--mono); }
 .lib__acts { display: flex; gap: 6px; flex: none; }
+.lib__pick { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--amber); cursor: pointer; }
+.lib__meta .rail { margin-top: 7px; }
+.lib__meta a { color: var(--amber); font: 500 11.5px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drivebar { display: flex; gap: 8px; margin: 12px 0 2px; flex-wrap: wrap; }
+.drivebar input {
+  flex: 1 1 180px;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: var(--ink-3);
+  border: 1px solid var(--edge);
+  border-radius: 9px;
+  padding: 10px 12px;
+}
+.drive-error { color: var(--bad); font-size: 13px; margin: 8px 0 0; }
 .lib__empty { color: var(--text-dim); font-size: 13px; text-align: center; padding: 14px; }
 
 /* ── misc ─────────────────────────────────────────────────────────────── */

@@ -12,6 +12,11 @@ RUN python -m venv /opt/venv \
 # ---- runtime stage --------------------------------------------------------
 FROM python:3.12-slim
 
+# rclone uploads finished archives to Google Drive.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends rclone ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \

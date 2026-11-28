@@ -32,6 +32,9 @@ const el = {
   dropServer: $('dropServer'), failMessage: $('failMessage'), retry: $('retry'),
 
   panelLibrary: $('panelLibrary'), library: $('library'), refreshJobs: $('refreshJobs'),
+  driveBar: $('driveBar'), driveFolder: $('driveFolder'), driveSelected: $('driveSelected'),
+  driveClear: $('driveClear'), driveError: $('driveError'),
+  panelDrive: $('panelDrive'), driveList: $('driveList'),
 };
 
 const MOSAIC_LIMIT = 400;      // beyond this the tile grid stops being readable
@@ -50,6 +53,8 @@ const state = {
   stream: null,
   poller: null,
   libraryTimer: null,
+  driveTimer: null,
+  driveSel: new Set(),   // finished job ids ticked for a Drive upload
   mosaicFor: 0,
   maxUploadBytes: 500 * 1024 * 1024,
   attached: false,
@@ -103,6 +108,8 @@ function showGate() {
   stopWatching();
   clearInterval(state.libraryTimer);
   state.libraryTimer = null;
+  clearTimeout(state.driveTimer);
+  state.driveTimer = null;
   el.workspace.hidden = true;
   el.gate.hidden = false;
   el.password.focus();
@@ -114,6 +121,7 @@ function showWorkspace() {
   refreshLibrary();
   clearInterval(state.libraryTimer);
   state.libraryTimer = setInterval(refreshLibrary, LIBRARY_POLL_MS);
+  refreshDrive();
 }
 
 function liveView(name) {
@@ -962,7 +970,10 @@ async function refreshLibrary() {
   }
 
   el.panelLibrary.hidden = jobs.length === 0;
+  const ready = new Set(jobs.filter((job) => job.stage === 'done').map((job) => job.id));
+  state.driveSel.forEach((id) => { if (!ready.has(id)) state.driveSel.delete(id); });
   el.library.replaceChildren(...jobs.map(renderLibraryRow));
+  paintDriveBar();
 
   // While a file is going up there is no server-side job yet. Without this
   // guard the poll below would decide nothing is running and reset the view
@@ -988,6 +999,19 @@ async function refreshLibrary() {
 function renderLibraryRow(job) {
   const row = document.createElement('li');
   row.className = 'lib';
+
+  if (job.stage === 'done') {
+    const pick = document.createElement('input');
+    pick.type = 'checkbox';
+    pick.className = 'lib__pick';
+    pick.title = 'Select for Google Drive';
+    pick.checked = state.driveSel.has(job.id);
+    pick.addEventListener('change', () => {
+      if (pick.checked) state.driveSel.add(job.id); else state.driveSel.delete(job.id);
+      paintDriveBar();
+    });
+    row.appendChild(pick);
+  }
 
   const dot = document.createElement('span');
   dot.className = 'lib__state';
@@ -1028,6 +1052,7 @@ function renderLibraryRow(job) {
     link.setAttribute('download', job.zip_name);
     link.textContent = 'Download';
     acts.appendChild(link);
+    acts.appendChild(button('Drive', 'btn btn--icon', (event) => startDrive([job.id], '', event.currentTarget)));
   }
 
   acts.appendChild(button('Delete', 'btn btn--icon btn--danger', async (event) => {
@@ -1050,6 +1075,156 @@ function button(label, className, handler) {
 }
 
 el.refreshJobs.addEventListener('click', refreshLibrary);
+
+/* ── google drive ─────────────────────────────────────────────────────── */
+const DRIVE_POLL_ACTIVE_MS = 1500;
+const DRIVE_POLL_IDLE_MS = 15000;
+
+function paintDriveBar() {
+  const count = state.driveSel.size;
+  el.driveBar.hidden = count === 0;
+  el.driveFolder.hidden = count < 2;
+  if (count > 1 && !el.driveFolder.placeholder.startsWith('Pagesmith')) {
+    el.driveFolder.placeholder = `Pagesmith ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
+  }
+  el.driveSelected.textContent = count > 1 ? `Upload ${count} to Drive` : 'Upload to Drive';
+}
+
+function showDriveError(message) {
+  el.driveError.textContent = message || '';
+  el.driveError.hidden = !message;
+}
+
+async function startDrive(ids, folder, trigger) {
+  showDriveError('');
+  if (trigger) trigger.disabled = true;
+  try {
+    await api('/api/drive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_ids: ids, folder }),
+    });
+    ids.forEach((id) => state.driveSel.delete(id));
+    el.driveFolder.value = '';
+    el.driveFolder.placeholder = 'Drive folder name';
+    refreshLibrary();
+  } catch (err) {
+    if (err.message !== 'unauthenticated') showDriveError(err.message);
+  } finally {
+    if (trigger) trigger.disabled = false;
+    refreshDrive();
+  }
+}
+
+el.driveSelected.addEventListener('click', () => {
+  const ids = [...state.driveSel];
+  const folder = ids.length > 1 ? (el.driveFolder.value.trim() || el.driveFolder.placeholder) : '';
+  startDrive(ids, folder, el.driveSelected);
+});
+
+el.driveClear.addEventListener('click', () => {
+  state.driveSel.clear();
+  showDriveError('');
+  refreshLibrary();
+});
+
+async function refreshDrive() {
+  clearTimeout(state.driveTimer);
+  let uploads = [];
+  try {
+    ({ uploads } = await api('/api/drive'));
+  } catch (err) {
+    if (err.message === 'unauthenticated') return;
+  }
+  el.panelDrive.hidden = uploads.length === 0;
+  el.driveList.replaceChildren(...uploads.map(renderDriveRow));
+  const busy = uploads.some((upload) => upload.active);
+  state.driveTimer = setTimeout(refreshDrive, busy ? DRIVE_POLL_ACTIVE_MS : DRIVE_POLL_IDLE_MS);
+}
+
+function driveProgress(u) {
+  if (u.stage === 'uploading') {
+    const parts = [`${u.percent}%`, `${humanBytes(u.bytes_done)} / ${humanBytes(u.bytes_total)}`];
+    if (u.files_total) parts.push(`${u.files_done}/${u.files_total} files`);
+    if (u.speed) parts.push(`${humanBytes(u.speed)}/s`);
+    if (u.eta) parts.push(`ETA ${humanTime(u.eta)}`);
+    if (u.attempt > 1) parts.push(`try ${u.attempt}`);
+    return parts.join(' · ');
+  }
+  return u.message || u.stage_label;
+}
+
+function renderDriveRow(u) {
+  const row = document.createElement('li');
+  row.className = 'lib';
+
+  const dot = document.createElement('span');
+  dot.className = 'lib__state';
+  dot.dataset.state = u.active ? 'active' : u.stage === 'done' ? 'done' : 'fail';
+
+  const meta = document.createElement('span');
+  meta.className = 'lib__meta';
+  const name = document.createElement('b');
+  name.textContent = u.folder;
+  name.title = u.names.join('\n');
+  meta.appendChild(name);
+
+  if (u.active) {
+    const sub = document.createElement('small');
+    sub.textContent = `${u.stage_label} · ${driveProgress(u)}`;
+    const rail = document.createElement('div');
+    rail.className = 'rail';
+    const fill = document.createElement('div');
+    fill.className = 'rail__fill';
+    fill.style.width = `${u.percent}%`;
+    rail.appendChild(fill);
+    meta.append(sub, rail);
+  } else if (u.stage === 'done') {
+    const link = document.createElement('a');
+    link.href = u.link;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = u.link;
+    const sub = document.createElement('small');
+    sub.textContent = `${u.names.length} archive${u.names.length === 1 ? '' : 's'} · ${humanBytes(u.bytes_total)} · anyone with the link can view`;
+    meta.append(link, sub);
+  } else {
+    const sub = document.createElement('small');
+    sub.textContent = u.error || u.stage_label;
+    meta.appendChild(sub);
+  }
+
+  const acts = document.createElement('span');
+  acts.className = 'lib__acts';
+  if (u.active) {
+    acts.appendChild(button('Cancel', 'btn btn--icon btn--danger', async (event) => {
+      event.currentTarget.disabled = true;
+      try { await api(`/api/drive/${u.id}/cancel`, { method: 'POST' }); } catch (_) { /* ignore */ }
+      refreshDrive();
+    }));
+  } else {
+    if (u.stage === 'done') {
+      acts.appendChild(button('Copy link', 'btn btn--icon', async (event) => {
+        const node = event.currentTarget;
+        try {
+          await navigator.clipboard.writeText(u.link);
+          node.textContent = 'Copied';
+        } catch (_) {
+          node.textContent = 'Copy failed';
+        }
+        setTimeout(() => { node.textContent = 'Copy link'; }, 1500);
+      }));
+    }
+    acts.appendChild(button('Remove', 'btn btn--icon btn--danger', async (event) => {
+      event.currentTarget.disabled = true;
+      try { await api(`/api/drive/${u.id}`, { method: 'DELETE' }); } catch (_) { /* ignore */ }
+      refreshDrive();
+    }));
+  }
+
+  row.append(dot, meta, acts);
+  return row;
+}
 
 /* ── boot ─────────────────────────────────────────────────────────────── */
 (async function boot() {

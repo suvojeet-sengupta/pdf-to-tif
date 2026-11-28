@@ -13,3 +13,6 @@ data/
 .env
 .env.*
 !.env.example
+
+# rclone config holds the Google Drive token.
+rclone/
